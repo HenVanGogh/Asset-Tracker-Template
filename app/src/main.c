@@ -14,8 +14,15 @@
 #include "app_common.h"
 #include "button.h"
 #include "network.h"
+#if defined(CONFIG_APP_CLOUD)
 #include "cloud.h"
+#endif
+#if defined(CONFIG_APP_CUSTOM_MQTT)
+#include "modules/custom_mqtt/custom_mqtt.h"
+#endif
+#if defined(CONFIG_APP_FOTA)
 #include "fota.h"
+#endif
 #include "location.h"
 #include "cbor_helper.h"
 
@@ -50,12 +57,20 @@ ZBUS_CHAN_DEFINE(TIMER_CHAN,
  * We use the X-macros to make the code more maintainable.
  */
 #define CHANNEL_LIST(X)						\
-	X(CLOUD_CHAN,		struct cloud_msg)		\
+	CLOUD_CHANNELS(X)				\
 	X(BUTTON_CHAN,		struct button_msg)			\
-	X(FOTA_CHAN,		enum fota_msg_type)		\
 	X(NETWORK_CHAN,		struct network_msg)		\
 	X(LOCATION_CHAN,	enum location_msg_type)		\
 	X(TIMER_CHAN,		int)
+
+/* Define cloud channels based on configuration */
+#if defined(CONFIG_APP_CLOUD)
+#define CLOUD_CHANNELS(X) X(CLOUD_CHAN, struct cloud_msg)
+#elif defined(CONFIG_APP_CUSTOM_MQTT)
+#define CLOUD_CHANNELS(X) X(CUSTOM_MQTT_CHAN, struct custom_mqtt_msg)
+#else
+#define CLOUD_CHANNELS(X)
+#endif
 
 /* Calculate the maximum message size from the list of channels */
 #define MAX_MSG_SIZE				MAX_MSG_SIZE_FROM_LIST(CHANNEL_LIST)
@@ -92,6 +107,7 @@ static void wait_for_trigger_exit(void *o);
 static void idle_entry(void *o);
 static void idle_run(void *o);
 
+#if defined(CONFIG_APP_FOTA)
 static void fota_entry(void *o);
 static void fota_run(void *o);
 
@@ -108,6 +124,7 @@ static void fota_applying_image_entry(void *o);
 static void fota_applying_image_run(void *o);
 
 static void fota_rebooting_entry(void *o);
+#endif
 
 enum state {
 	/* Normal operation */
@@ -124,6 +141,7 @@ enum state {
 			/* Wait for timer or button press to trigger the next sample */
 			STATE_WAIT_FOR_TRIGGER,
 	/* Ongoing FOTA process, triggers are blocked */
+#if defined(CONFIG_APP_FOTA)
 	STATE_FOTA,
 		/* FOTA image is being downloaded */
 		STATE_FOTA_DOWNLOADING,
@@ -137,6 +155,7 @@ enum state {
 		STATE_FOTA_APPLYING_IMAGE,
 		/* Rebooting */
 		STATE_FOTA_REBOOTING,
+#endif
 };
 
 /* State object for the app module.
@@ -201,6 +220,7 @@ static const struct smf_state states[] = {
 		&states[STATE_TRIGGERING],
 		NULL
 	),
+#if defined(CONFIG_APP_FOTA)
 	[STATE_FOTA] = SMF_CREATE_STATE(
 		fota_entry,
 		fota_run,
@@ -243,6 +263,7 @@ static const struct smf_state states[] = {
 		&states[STATE_FOTA],
 		NULL
 	),
+#endif
 };
 
 /* Static helper function */
@@ -258,6 +279,8 @@ static void task_wdt_callback(int channel_id, void *user_data)
 static void sensor_and_poll_triggers_send(void)
 {
 	int err;
+
+#if defined(CONFIG_APP_CLOUD)
 	struct cloud_msg cloud_msg = {
 		.type = CLOUD_POLL_SHADOW
 	};
@@ -268,6 +291,18 @@ static void sensor_and_poll_triggers_send(void)
 		SEND_FATAL_ERROR();
 		return;
 	}
+#elif defined(CONFIG_APP_CUSTOM_MQTT)
+	struct custom_mqtt_msg mqtt_msg = {
+		.type = CUSTOM_MQTT_EVT_DATA_SEND
+	};
+
+	err = zbus_chan_pub(&CUSTOM_MQTT_CHAN, &mqtt_msg, K_SECONDS(1));
+	if (err) {
+		LOG_ERR("zbus_chan_pub MQTT trigger, error: %d", err);
+		SEND_FATAL_ERROR();
+		return;
+	}
+#endif
 
 #if defined(CONFIG_APP_REQUEST_NETWORK_QUALITY)
 	struct network_msg network_msg = {
@@ -308,6 +343,7 @@ static void sensor_and_poll_triggers_send(void)
 	}
 #endif /* CONFIG_APP_ENVIRONMENTAL */
 
+#if defined(CONFIG_APP_FOTA)
 	/* Send FOTA poll trigger */
 	enum fota_msg_type fota_msg = FOTA_POLL_REQUEST;
 
@@ -317,6 +353,7 @@ static void sensor_and_poll_triggers_send(void)
 		SEND_FATAL_ERROR();
 		return;
 	}
+#endif /* CONFIG_APP_FOTA */
 }
 
 /* Delayable work used to send messages on the TIMER_CHAN */
@@ -355,6 +392,7 @@ static void running_entry(void *o)
 
 static void running_run(void *o)
 {
+#if defined(CONFIG_APP_FOTA)
 	const struct main_state *state_object = (const struct main_state *)o;
 
 	if (state_object->chan == &FOTA_CHAN) {
@@ -365,6 +403,9 @@ static void running_run(void *o)
 			return;
 		}
 	}
+#else
+	ARG_UNUSED(o);
+#endif
 }
 
 /* STATE_IDLE */
@@ -403,6 +444,7 @@ static void idle_run(void *o)
 {
 	struct main_state *state_object = o;
 
+#if defined(CONFIG_APP_CLOUD)
 	if (state_object->chan == &CLOUD_CHAN) {
 		const struct cloud_msg *msg = MSG_TO_CLOUD_MSG_PTR(state_object->msg_buf);
 
@@ -412,6 +454,17 @@ static void idle_run(void *o)
 			return;
 		}
 	}
+#elif defined(CONFIG_APP_CUSTOM_MQTT)
+	if (state_object->chan == &CUSTOM_MQTT_CHAN) {
+		const struct custom_mqtt_msg *msg = (const struct custom_mqtt_msg *)state_object->msg_buf;
+
+		if (msg->type == CUSTOM_MQTT_EVT_CONNECTED) {
+			state_object->connected = true;
+			smf_set_state(SMF_CTX(state_object), &states[STATE_TRIGGERING]);
+			return;
+		}
+	}
+#endif
 }
 
 /* STATE_CONNECTED */
@@ -434,9 +487,10 @@ static void triggering_entry(void *o)
 
 static void triggering_run(void *o)
 {
-	int err;
 	struct main_state *state_object = o;
 
+#if defined(CONFIG_APP_CLOUD)
+	int err;
 	if (state_object->chan == &CLOUD_CHAN) {
 		const struct cloud_msg *msg = MSG_TO_CLOUD_MSG_PTR(state_object->msg_buf);
 
@@ -465,6 +519,23 @@ static void triggering_run(void *o)
 			}
 		}
 	}
+#elif defined(CONFIG_APP_CUSTOM_MQTT)
+	if (state_object->chan == &CUSTOM_MQTT_CHAN) {
+		const struct custom_mqtt_msg *msg = (const struct custom_mqtt_msg *)state_object->msg_buf;
+
+		if (msg->type == CUSTOM_MQTT_EVT_DISCONNECTED) {
+			state_object->connected = false;
+			smf_set_state(SMF_CTX(state_object), &states[STATE_IDLE]);
+			return;
+		}
+
+		if (msg->type == CUSTOM_MQTT_EVT_DATA_RECEIVED) {
+			/* For custom MQTT, we can handle received configuration data here */
+			/* For now, just continue with default interval */
+			LOG_INF("MQTT data received, continuing with default interval");
+		}
+	}
+#endif
 }
 
 /* STATE_SAMPLE_DATA */
@@ -609,6 +680,7 @@ static void wait_for_trigger_exit(void *o)
 	(void)k_work_cancel_delayable(&trigger_work);
 }
 
+#if defined(CONFIG_APP_FOTA)
 /* STATE_FOTA */
 
 static void fota_entry(void *o)
@@ -813,6 +885,7 @@ static void fota_rebooting_entry(void *o)
 
 	sys_reboot(SYS_REBOOT_COLD);
 }
+#endif /* CONFIG_APP_FOTA */
 
 int main(void)
 {

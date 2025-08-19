@@ -1,0 +1,68 @@
+#
+# Copyright (c) 2024 Nordic Semiconductor
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+menuconfig APP_CUSTOM_MQTT
+	bool "Custom MQTT module"
+	default n
+	help
+	  Enable the custom MQTT module for connecting to t4as.org server.
+
+if APP_CUSTOM_MQTT
+
+config APP_CUSTOM_MQTT_SHELL
+	bool "Enable custom MQTT shell"
+	default y if SHELL
+	help
+	  Enable custom MQTT shell commands.
+
+config APP_CUSTOM_MQTT_SEC_TAG
+	int "Security tag for custom MQTT connection"
+	default 12345
+	help
+	  The security tag that corresponds to the credentials (CA, client cert,
+	  private key) provisioned in the modem for the custom MQTT broker.
+
+config APP_CUSTOM_MQTT_PAYLOAD_BUFFER_MAX_SIZE
+	int "Payload maximum buffer size"
+	default 512
+	help
+	  Maximum size of the buffer sent over MQTT to the custom server.
+
+config APP_CUSTOM_MQTT_THREAD_STACK_SIZE
+	int "Thread stack size for custom MQTT module"
+	default 2048
+	help
+	  Stack size for the custom MQTT module thread.
+
+config APP_CUSTOM_MQTT_PUBLISH_TOPIC
+	string "MQTT publish topic"
+	default "devices/data/up"
+	help
+	  MQTT topic for publishing device data.
+
+config APP_CUSTOM_MQTT_SUBSCRIBE_TOPIC
+	string "MQTT subscribe topic"
+	default "devices/command/down"
+	help
+	  MQTT topic for receiving commands from server.
+
+config APP_CUSTOM_MQTT_KEEPALIVE_SECONDS
+	int "MQTT keepalive interval in seconds"
+	default 60
+	help
+	  MQTT keepalive interval in seconds.
+
+config APP_CUSTOM_MQTT_MESSAGE_QUEUE_SIZE
+	int "Message queue size for custom MQTT module"
+	default 10
+	help
+	  Size of the message queue for the custom MQTT module.
+
+module = APP_CUSTOM_MQTT
+module-str = APP_CUSTOM_MQTT
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # APP_CUSTOM_MQTT
