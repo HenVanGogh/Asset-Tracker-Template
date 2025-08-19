@@ -89,6 +89,11 @@ static void sample_sensors(const struct device *const bme680)
 	struct sensor_value press = { 0 };
 	struct sensor_value humidity = { 0 };
 
+	if (!device_is_ready(bme680)) {
+		LOG_ERR("BME680 device not ready during sampling");
+		return;
+	}
+
 	err = sensor_sample_fetch(bme680);
 	if (err) {
 		LOG_ERR("sensor_sample_fetch, error: %d", err);
@@ -98,24 +103,28 @@ static void sample_sensors(const struct device *const bme680)
 
 	err = sensor_channel_get(bme680, SENSOR_CHAN_AMBIENT_TEMP, &temp);
 	if (err) {
-		LOG_ERR("sensor_channel_get, error: %d", err);
+		LOG_ERR("sensor_channel_get temperature, error: %d", err);
 		SEND_FATAL_ERROR();
 		return;
 	}
 
 	err = sensor_channel_get(bme680, SENSOR_CHAN_PRESS, &press);
 	if (err) {
-		LOG_ERR("sensor_channel_get, error: %d", err);
+		LOG_ERR("sensor_channel_get pressure, error: %d", err);
 		SEND_FATAL_ERROR();
 		return;
 	}
 
 	err = sensor_channel_get(bme680, SENSOR_CHAN_HUMIDITY, &humidity);
 	if (err) {
-		LOG_ERR("sensor_channel_get, error: %d", err);
+		LOG_ERR("sensor_channel_get humidity, error: %d", err);
 		SEND_FATAL_ERROR();
 		return;
 	}
+
+	/* Log raw sensor values for debugging */
+	LOG_DBG("Raw sensor values - Temp: %d.%06d, Press: %d.%06d, Humidity: %d.%06d",
+		temp.val1, temp.val2, press.val1, press.val2, humidity.val1, humidity.val2);
 
 	struct environmental_msg msg = {
 		.type = ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE,
@@ -181,6 +190,15 @@ static void env_module_thread(void)
 	};
 
 	LOG_DBG("Environmental module task started");
+
+	/* Check if BME680 device is ready */
+	if (!device_is_ready(environmental_state.bme680)) {
+		LOG_ERR("BME680 device is not ready");
+		SEND_FATAL_ERROR();
+		return;
+	}
+	
+	LOG_INF("BME680 device is ready");
 
 	task_wdt_id = task_wdt_add(wdt_timeout_ms, env_wdt_callback, (void *)k_current_get());
 	if (task_wdt_id < 0) {

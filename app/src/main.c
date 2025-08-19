@@ -23,7 +23,9 @@
 #if defined(CONFIG_APP_FOTA)
 #include "fota.h"
 #endif
+#if defined(CONFIG_APP_LOCATION)
 #include "location.h"
+#endif
 #include "cbor_helper.h"
 
 #if defined(CONFIG_APP_LED)
@@ -60,7 +62,7 @@ ZBUS_CHAN_DEFINE(TIMER_CHAN,
 	CLOUD_CHANNELS(X)				\
 	X(BUTTON_CHAN,		struct button_msg)			\
 	X(NETWORK_CHAN,		struct network_msg)		\
-	X(LOCATION_CHAN,	enum location_msg_type)		\
+	LOCATION_CHANNELS(X)				\
 	X(TIMER_CHAN,		int)
 
 /* Define cloud channels based on configuration */
@@ -70,6 +72,13 @@ ZBUS_CHAN_DEFINE(TIMER_CHAN,
 #define CLOUD_CHANNELS(X) X(CUSTOM_MQTT_CHAN, struct custom_mqtt_msg)
 #else
 #define CLOUD_CHANNELS(X)
+#endif
+
+/* Define location channels based on configuration */
+#if defined(CONFIG_APP_LOCATION)
+#define LOCATION_CHANNELS(X) X(LOCATION_CHAN, enum location_msg_type)
+#else
+#define LOCATION_CHANNELS(X)
 #endif
 
 /* Calculate the maximum message size from the list of channels */
@@ -543,7 +552,9 @@ static void triggering_run(void *o)
 static void sample_data_entry(void *o)
 {
 	int err;
+#if defined(CONFIG_APP_LOCATION)
 	enum location_msg_type location_msg = LOCATION_SEARCH_TRIGGER;
+#endif
 	struct main_state *state_object = (struct main_state *)o;
 
 	LOG_DBG("%s", __func__);
@@ -571,18 +582,26 @@ static void sample_data_entry(void *o)
 	/* Record the start time of sampling */
 	state_object->sample_start_time = k_uptime_seconds();
 
+#if defined(CONFIG_APP_LOCATION)
 	err = zbus_chan_pub(&LOCATION_CHAN, &location_msg, K_SECONDS(1));
 	if (err) {
 		LOG_ERR("zbus_chan_pub data sample trigger, error: %d", err);
 		SEND_FATAL_ERROR();
 		return;
 	}
+#else
+	/* If location is disabled, immediately trigger sensor data collection and continue */
+	LOG_INF("Location module disabled, proceeding directly to sensor data collection");
+	sensor_and_poll_triggers_send();
+	smf_set_state(SMF_CTX(state_object), &states[STATE_WAIT_FOR_TRIGGER]);
+#endif
 }
 
 static void sample_data_run(void *o)
 {
 	const struct main_state *state_object = (const struct main_state *)o;
 
+#if defined(CONFIG_APP_LOCATION)
 	if (state_object->chan == &LOCATION_CHAN) {
 		enum location_msg_type msg = MSG_TO_LOCATION_TYPE(state_object->msg_buf);
 
@@ -592,6 +611,7 @@ static void sample_data_run(void *o)
 			return;
 		}
 	}
+#endif
 
 	/* We are already sampling, ignore any new triggers */
 	if (state_object->chan == &BUTTON_CHAN) {

@@ -37,6 +37,30 @@ config APP_CUSTOM_MQTT_THREAD_STACK_SIZE
 	help
 	  Stack size for the custom MQTT module thread.
 
+config APP_CUSTOM_MQTT_BROKER_HOSTNAME
+	string "MQTT broker hostname"
+	default "49fc73a33de54e32966eac3525e9106c.s1.eu.hivemq.cloud"
+	help
+	  Hostname of the MQTT broker to connect to.
+
+config APP_CUSTOM_MQTT_BROKER_PORT
+	int "MQTT broker port"
+	default 8883
+	help
+	  Port number of the MQTT broker (8883 for TLS, 1883 for non-TLS).
+
+config APP_CUSTOM_MQTT_USERNAME
+	string "MQTT username"
+	default "hivemq.webclient.1755608677668"
+	help
+	  Username for MQTT broker authentication.
+
+config APP_CUSTOM_MQTT_PASSWORD
+	string "MQTT password"
+	default "I.a$,MC0%bPJ9fdegO82"
+	help
+	  Password for MQTT broker authentication.
+
 config APP_CUSTOM_MQTT_PUBLISH_TOPIC
 	string "MQTT publish topic"
 	default "devices/data/up"
