@@ -327,13 +327,9 @@ static void sensor_and_poll_triggers_send(void)
 #endif /* CONFIG_APP_REQUEST_NETWORK_QUALITY */
 
 #if defined(CONFIG_APP_POWER)
-	struct power_msg power_msg = {
-		.type = POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST,
-	};
-
-	err = zbus_chan_pub(&POWER_CHAN, &power_msg, K_SECONDS(1));
+	err = power_sample_request();
 	if (err) {
-		LOG_ERR("zbus_chan_pub, error: %d", err);
+		LOG_ERR("power_sample_request, error: %d", err);
 		SEND_FATAL_ERROR();
 		return;
 	}

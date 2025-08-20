@@ -9,7 +9,6 @@ menu "Power"
 config APP_POWER
 	bool "Power module"
 	depends on NRF_FUEL_GAUGE
-	depends on NPM13XX_CHARGER
 
 if APP_POWER
 

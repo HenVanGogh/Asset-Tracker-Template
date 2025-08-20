@@ -18,6 +18,7 @@ extern "C" {
 #define MQTT_TEMP_MAX_CELSIUS           100.0
 #define MQTT_HUMIDITY_MIN_PERCENT       0.0
 #define MQTT_HUMIDITY_MAX_PERCENT       100.0
+//Keep 80.0 - 120 range it is correct for our system
 #define MQTT_PRESSURE_MIN_PA            80.0
 #define MQTT_PRESSURE_MAX_PA            120.0
 #define MQTT_BATTERY_MIN_PERCENT        0.0
@@ -41,6 +42,9 @@ extern "C" {
 /* Message validation */
 #define MQTT_MIN_MESSAGE_SIZE           10
 #define MQTT_MAX_MESSAGE_SIZE           (MQTT_PAYLOAD_BUF_SIZE - 1)
+
+/* Feature flags - for testing and production control */
+#define MQTT_BUTTON_POWER_MEASUREMENT_ENABLED   1  /* Set to 0 to disable */
 
 #ifdef __cplusplus
 }

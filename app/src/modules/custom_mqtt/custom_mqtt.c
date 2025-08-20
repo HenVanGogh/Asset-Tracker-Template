@@ -35,6 +35,10 @@
 #include "power.h"
 #endif
 
+#if defined(CONFIG_APP_BUTTON)
+#include "button.h"
+#endif
+
 /* Register log module */
 LOG_MODULE_REGISTER(custom_mqtt, CONFIG_APP_CUSTOM_MQTT_LOG_LEVEL);
 
@@ -101,8 +105,8 @@ ZBUS_CHAN_ADD_OBS(LOCATION_CHAN, custom_mqtt_subscriber, 0);
 #if defined(CONFIG_APP_ENVIRONMENTAL)
 ZBUS_CHAN_ADD_OBS(ENVIRONMENTAL_CHAN, custom_mqtt_subscriber, 0);
 #endif
-#if defined(CONFIG_APP_POWER)
-ZBUS_CHAN_ADD_OBS(POWER_CHAN, custom_mqtt_subscriber, 0);
+#if defined(CONFIG_APP_BUTTON)
+ZBUS_CHAN_ADD_OBS(BUTTON_CHAN, custom_mqtt_subscriber, 0);
 #endif
 
 /* Define zbus channel */
@@ -126,6 +130,21 @@ static int mqtt_publish_data(const char *data, size_t len);
 static bool validate_sensor_data(double value, double min, double max);
 static bool validate_json_string(const char *json_str);
 static int safe_publish_json(cJSON *json, const char *data_type);
+
+/* Message processing functions */
+static void process_network_msg(const struct network_msg *msg);
+#if defined(CONFIG_APP_LOCATION)
+static void process_location_data(const struct location_msg *msg);
+#endif
+#if defined(CONFIG_APP_ENVIRONMENTAL)
+static void process_environmental_data(const struct environmental_msg *msg);
+#endif
+#if defined(CONFIG_APP_POWER)
+static void process_power_data(const struct power_msg *msg);
+#endif
+#if defined(CONFIG_APP_BUTTON) && defined(MQTT_BUTTON_POWER_MEASUREMENT_ENABLED)
+static void process_button_msg(const struct button_msg *msg);
+#endif
 
 /* State machine forward declarations */
 static void idle_entry(void *obj);
@@ -862,6 +881,27 @@ cleanup:
 }
 #endif
 
+#if defined(CONFIG_APP_BUTTON) && defined(MQTT_BUTTON_POWER_MEASUREMENT_ENABLED)
+static void process_button_msg(const struct button_msg *msg)
+{
+	LOG_INF("Button %d %s detected", msg->button_number, 
+		msg->type == BUTTON_PRESS_SHORT ? "short press" : "long press");
+	
+	/* Only handle button 1 short press for power measurement trigger */
+	if (msg->button_number == 1 && msg->type == BUTTON_PRESS_SHORT) {
+		LOG_INF("Requesting power measurement via button press");
+		
+		/* Request power measurement directly */
+		int ret = power_sample_request();
+		if (ret != 0) {
+			LOG_ERR("Failed to request power measurement: %d", ret);
+		} else {
+			LOG_DBG("Power measurement request sent successfully");
+		}
+	}
+}
+#endif
+
 static void process_network_msg(const struct network_msg *msg)
 {
 	switch (msg->type) {
@@ -960,19 +1000,19 @@ static void custom_mqtt_thread(void)
 				}
 			}
 #endif
-#if defined(CONFIG_APP_POWER)
-			else if (chan == &POWER_CHAN) {
-				struct power_msg msg;
-				ret = zbus_chan_read(&POWER_CHAN, &msg, K_MSEC(100));
+#if defined(CONFIG_APP_BUTTON) && defined(MQTT_BUTTON_POWER_MEASUREMENT_ENABLED)
+			else if (chan == &BUTTON_CHAN) {
+				struct button_msg msg;
+				ret = zbus_chan_read(&BUTTON_CHAN, &msg, K_MSEC(100));
 				if (ret == 0) {
 					k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
-					process_power_data(&msg);
+					process_button_msg(&msg);
 					k_mutex_unlock(&mqtt_ctx.data_mutex);
 				} else {
 					if (ret != -EBUSY) {
-						LOG_WRN("Failed to read POWER_CHAN: %d", ret);
+						LOG_WRN("Failed to read BUTTON_CHAN: %d", ret);
 					} else {
-						LOG_DBG("POWER_CHAN busy, will retry");
+						LOG_DBG("BUTTON_CHAN busy, will retry");
 					}
 				}
 			}

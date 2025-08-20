@@ -8,16 +8,10 @@
 #define _POWER_H_
 
 #include <zephyr/kernel.h>
-#include <zephyr/zbus/zbus.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* Channels provided by this module */
-ZBUS_CHAN_DECLARE(
-	POWER_CHAN
-);
 
 enum power_msg_type {
 	/* Output message types */
@@ -46,6 +40,14 @@ struct power_msg {
 };
 
 #define MSG_TO_POWER_MSG(_msg)	(*(const struct power_msg *)_msg)
+
+/* Function declarations */
+
+/** @brief Request a power sample and publish the result
+ *
+ * @return 0 on success, negative error code on failure
+ */
+int power_sample_request(void);
 
 #ifdef __cplusplus
 }

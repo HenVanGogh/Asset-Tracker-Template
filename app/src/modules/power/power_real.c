@@ -12,7 +12,6 @@
 #include <nrf_fuel_gauge.h>
 
 #include "power.h"
-#include "lp803448_model.h"
 
 LOG_MODULE_REGISTER(power_module, CONFIG_APP_POWER_LOG_LEVEL);
 
@@ -20,10 +19,23 @@ LOG_MODULE_REGISTER(power_module, CONFIG_APP_POWER_LOG_LEVEL);
 static const struct device *charger_dev = DEVICE_DT_GET(DT_NODELABEL(npm1300_charger));
 static int64_t ref_time;
 
+/* Battery model (using simplified values for now) */
+static const struct battery_model battery_model = {
+	.nrf_fuel_gauge_version_major = 1,
+	.nrf_fuel_gauge_version_minor = 0,
+	.capacity = 3000, /* mAh */
+	.ocv = {
+		3200, 3250, 3300, 3350, 3400, 3450, 3500, 3550, 3600, 3650,
+		3700, 3750, 3800, 3850, 3900, 3950, 4000, 4050, 4100, 4200
+	},
+	.curve_offset = 0,
+	.power_down_voltage_mv = 3000,
+};
+
 /* Current battery data */
 static struct power_msg current_power_data = {
-	.type = POWER_BATTERY_PERCENTAGE_SAMPLE_RESPONSE,
-	.percentage = 0.0,
+	.type = APP_DATA,
+	.percentage = 0.0f,
 	.timestamp = 0
 };
 
@@ -173,9 +185,9 @@ static int power_module_init(void)
 	LOG_INF("Initializing power module");
 	
 	/* Initialize with default values */
-	current_power_data.type = POWER_BATTERY_PERCENTAGE_SAMPLE_RESPONSE;
+	current_power_data.type = APP_DATA;
 	current_power_data.timestamp = k_uptime_get();
-	current_power_data.percentage = 50.0; /* Default until first reading */
+	current_power_data.percentage = 50.0f; /* Default until first reading */
 	
 	module_initialized = true;
 	
