@@ -1,0 +1,44 @@
+#
+# Copyright (c) 2025 Nordic Semiconductor ASA
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+menuconfig APP_UART_SENSOR
+	bool "UART sensor module"
+	default y
+	help
+	  Enable UART sensor communication module for external sensor data.
+
+if APP_UART_SENSOR
+
+module = APP_UART_SENSOR
+module-str = UART sensor
+source "subsys/logging/Kconfig.template.log_config"
+
+config APP_UART_SENSOR_THREAD_STACK_SIZE
+	int "UART sensor module thread stack size"
+	default 4096
+	help
+	  Stack size for the UART sensor module thread
+
+config APP_UART_SENSOR_MSG_PROCESSING_TIMEOUT_SECONDS
+	int "UART sensor message processing timeout"
+	default 5
+	range 1 3600
+	help
+	  Timeout for processing UART sensor messages in seconds
+
+config APP_UART_SENSOR_WATCHDOG_TIMEOUT_SECONDS
+	int "UART sensor module watchdog timeout"
+	default 120
+	help
+	  Watchdog timeout for UART sensor module in seconds
+
+config APP_UART_SENSOR_TIMESTAMP
+	bool "UART sensor timestamp"
+	default y
+	help
+	  Include timestamp in UART sensor messages
+
+endif # APP_UART_SENSOR

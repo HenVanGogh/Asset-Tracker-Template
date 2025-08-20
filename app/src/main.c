@@ -26,6 +26,9 @@
 #if defined(CONFIG_APP_LOCATION)
 #include "location.h"
 #endif
+#if defined(CONFIG_APP_UART_SENSOR)
+#include "modules/uart_sensor/uart_sensor.h"
+#endif
 #include "cbor_helper.h"
 
 #if defined(CONFIG_APP_LED)
@@ -63,6 +66,7 @@ ZBUS_CHAN_DEFINE(TIMER_CHAN,
 	X(BUTTON_CHAN,		struct button_msg)			\
 	X(NETWORK_CHAN,		struct network_msg)		\
 	LOCATION_CHANNELS(X)				\
+	UART_SENSOR_CHANNELS(X)			\
 	X(TIMER_CHAN,		int)
 
 /* Define cloud channels based on configuration */
@@ -79,6 +83,13 @@ ZBUS_CHAN_DEFINE(TIMER_CHAN,
 #define LOCATION_CHANNELS(X) X(LOCATION_CHAN, enum location_msg_type)
 #else
 #define LOCATION_CHANNELS(X)
+#endif
+
+/* Define UART sensor channels based on configuration */
+#if defined(CONFIG_APP_UART_SENSOR)
+#define UART_SENSOR_CHANNELS(X) X(UART_SENSOR_CHAN, struct uart_sensor_msg)
+#else
+#define UART_SENSOR_CHANNELS(X)
 #endif
 
 /* Calculate the maximum message size from the list of channels */
@@ -347,6 +358,19 @@ static void sensor_and_poll_triggers_send(void)
 		return;
 	}
 #endif /* CONFIG_APP_ENVIRONMENTAL */
+
+#if defined(CONFIG_APP_UART_SENSOR)
+	struct uart_sensor_msg uart_sensor_msg = {
+		.type = UART_SENSOR_DATA_REQUEST,
+	};
+
+	err = zbus_chan_pub(&UART_SENSOR_CHAN, &uart_sensor_msg, K_SECONDS(1));
+	if (err) {
+		LOG_ERR("zbus_chan_pub UART sensor trigger, error: %d", err);
+		SEND_FATAL_ERROR();
+		return;
+	}
+#endif /* CONFIG_APP_UART_SENSOR */
 
 #if defined(CONFIG_APP_FOTA)
 	/* Send FOTA poll trigger */

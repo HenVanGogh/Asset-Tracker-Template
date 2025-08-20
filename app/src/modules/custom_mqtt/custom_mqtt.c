@@ -35,6 +35,10 @@
 #include "power.h"
 #endif
 
+#if defined(CONFIG_APP_UART_SENSOR)
+#include "uart_sensor.h"
+#endif
+
 #if defined(CONFIG_APP_BUTTON)
 #include "button.h"
 #endif
@@ -108,6 +112,9 @@ ZBUS_CHAN_ADD_OBS(ENVIRONMENTAL_CHAN, custom_mqtt_subscriber, 0);
 #if defined(CONFIG_APP_POWER)
 ZBUS_CHAN_ADD_OBS(POWER_CHAN, custom_mqtt_subscriber, 0);
 #endif
+#if defined(CONFIG_APP_UART_SENSOR)
+ZBUS_CHAN_ADD_OBS(UART_SENSOR_CHAN, custom_mqtt_subscriber, 0);
+#endif
 #if defined(CONFIG_APP_BUTTON)
 ZBUS_CHAN_ADD_OBS(BUTTON_CHAN, custom_mqtt_subscriber, 0);
 #endif
@@ -144,6 +151,9 @@ static void process_environmental_data(const struct environmental_msg *msg);
 #endif
 #if defined(CONFIG_APP_POWER)
 static void process_power_data(const struct power_msg *msg);
+#endif
+#if defined(CONFIG_APP_UART_SENSOR)
+static void process_uart_sensor_data(const struct uart_sensor_msg *msg);
 #endif
 #if defined(CONFIG_APP_BUTTON) && defined(MQTT_BUTTON_POWER_MEASUREMENT_ENABLED)
 static void process_button_msg(const struct button_msg *msg);
@@ -888,6 +898,72 @@ cleanup:
 }
 #endif
 
+#if defined(CONFIG_APP_UART_SENSOR)
+static void process_uart_sensor_data(const struct uart_sensor_msg *msg)
+{
+	cJSON *json = NULL;
+	cJSON *sensor_data = NULL;
+	
+	if (!msg) {
+		LOG_ERR("Invalid UART sensor message");
+		return;
+	}
+	
+	/* Validate sensor data ranges */
+	if (!SENSOR_VALUE_IN_RANGE(msg->temperature, UART_SENSOR_TEMP_MIN, UART_SENSOR_TEMP_MAX)) {
+		LOG_WRN("Temperature %.2f out of range [%.2f, %.2f]", 
+			msg->temperature, UART_SENSOR_TEMP_MIN, UART_SENSOR_TEMP_MAX);
+	}
+	
+	if (!SENSOR_VALUE_IN_RANGE(msg->humidity, UART_SENSOR_HUMIDITY_MIN, UART_SENSOR_HUMIDITY_MAX)) {
+		LOG_WRN("Humidity %.2f out of range [%.2f, %.2f]", 
+			msg->humidity, UART_SENSOR_HUMIDITY_MIN, UART_SENSOR_HUMIDITY_MAX);
+	}
+	
+	if (!SENSOR_VALUE_IN_RANGE(msg->probe_battery, UART_SENSOR_BATTERY_MIN, UART_SENSOR_BATTERY_MAX)) {
+		LOG_WRN("Probe battery %.2f out of range [%.2f, %.2f]", 
+			msg->probe_battery, UART_SENSOR_BATTERY_MIN, UART_SENSOR_BATTERY_MAX);
+	}
+	
+	/* Create JSON payload */
+	json = cJSON_CreateObject();
+	sensor_data = cJSON_CreateObject();
+	
+	if (!json || !sensor_data) {
+		LOG_ERR("Failed to create JSON objects");
+		goto cleanup;
+	}
+	
+	cJSON_AddItemToObject(json, "sensor_data", sensor_data);
+	cJSON_AddStringToObject(json, "type", "uart_sensor");
+	cJSON_AddNumberToObject(json, "sequence", mqtt_ctx.publish_sequence + 1);
+	
+	/* Add UART sensor data with proper precision */
+	cJSON_AddNumberToObject(sensor_data, "temperature", round(msg->temperature * 100) / 100.0);
+	cJSON_AddNumberToObject(sensor_data, "humidity", round(msg->humidity * 100) / 100.0);
+	cJSON_AddStringToObject(sensor_data, "probe_id", msg->probe_id);
+	cJSON_AddNumberToObject(sensor_data, "probe_battery", round(msg->probe_battery * 10) / 10.0);
+	
+#if defined(CONFIG_APP_UART_SENSOR_TIMESTAMP)
+	if (msg->timestamp > 0) {
+		cJSON_AddNumberToObject(sensor_data, "timestamp", msg->timestamp);
+	}
+#endif
+	
+	/* Convert to string and publish */
+	int ret = safe_publish_json(json, "uart_sensor");
+	if (ret == 0) {
+		LOG_INF("UART sensor data published: %s, T=%.1f°C, H=%.1f%%, Bat=%.1f%%", 
+			msg->probe_id, msg->temperature, msg->humidity, msg->probe_battery);
+	}
+
+cleanup:
+	if (json) {
+		cJSON_Delete(json);
+	}
+}
+#endif
+
 #if defined(CONFIG_APP_BUTTON) && defined(MQTT_BUTTON_POWER_MEASUREMENT_ENABLED)
 static void process_button_msg(const struct button_msg *msg)
 {
@@ -916,6 +992,17 @@ static void process_button_msg(const struct button_msg *msg)
 		} else {
 			LOG_ERR("Failed to get power data: %d", ret);
 		}
+
+#if defined(CONFIG_APP_UART_SENSOR)
+		/* Also trigger UART sensor data generation */
+		LOG_INF("Requesting UART sensor data via button press");
+		ret = uart_sensor_sample_request();
+		if (ret != 0) {
+			LOG_ERR("Failed to request UART sensor data: %d", ret);
+		} else {
+			LOG_INF("UART sensor data request triggered successfully");
+		}
+#endif
 	}
 }
 #endif
@@ -1032,6 +1119,25 @@ static void custom_mqtt_thread(void)
 						LOG_WRN("Failed to read POWER_CHAN: %d", ret);
 					} else {
 						LOG_DBG("POWER_CHAN busy, will retry");
+					}
+				}
+			}
+#endif
+#if defined(CONFIG_APP_UART_SENSOR)
+			else if (chan == &UART_SENSOR_CHAN) {
+				struct uart_sensor_msg msg;
+				ret = zbus_chan_read(&UART_SENSOR_CHAN, &msg, K_MSEC(100));
+				if (ret == 0) {
+					k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+					process_uart_sensor_data(&msg);
+					k_mutex_unlock(&mqtt_ctx.data_mutex);
+					LOG_DBG("ZBUS UART sensor data processed: %s, T=%.1f°C", 
+						msg.probe_id, msg.temperature);
+				} else {
+					if (ret != -EBUSY) {
+						LOG_WRN("Failed to read UART_SENSOR_CHAN: %d", ret);
+					} else {
+						LOG_DBG("UART_SENSOR_CHAN busy, will retry");
 					}
 				}
 			}

@@ -43,6 +43,17 @@ extern "C" {
 #define MQTT_MIN_MESSAGE_SIZE           10
 #define MQTT_MAX_MESSAGE_SIZE           (MQTT_PAYLOAD_BUF_SIZE - 1)
 
+/* Sensor value validation macro */
+#define SENSOR_VALUE_IN_RANGE(value, min, max) ((value) >= (min) && (value) <= (max))
+
+/* UART Sensor validation ranges - production quality limits */
+#define UART_SENSOR_TEMP_MIN           -40.0f   /* Minimum temperature in °C */
+#define UART_SENSOR_TEMP_MAX            85.0f   /* Maximum temperature in °C */
+#define UART_SENSOR_HUMIDITY_MIN         0.0f   /* Minimum humidity in % */
+#define UART_SENSOR_HUMIDITY_MAX       100.0f   /* Maximum humidity in % */
+#define UART_SENSOR_BATTERY_MIN          0.0f   /* Minimum battery level in % */
+#define UART_SENSOR_BATTERY_MAX        100.0f   /* Maximum battery level in % */
+
 /* Feature flags - for testing and production control */
 #define MQTT_BUTTON_POWER_MEASUREMENT_ENABLED   1  /* Set to 0 to disable */
 
