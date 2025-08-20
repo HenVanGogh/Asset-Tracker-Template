@@ -105,6 +105,9 @@ ZBUS_CHAN_ADD_OBS(LOCATION_CHAN, custom_mqtt_subscriber, 0);
 #if defined(CONFIG_APP_ENVIRONMENTAL)
 ZBUS_CHAN_ADD_OBS(ENVIRONMENTAL_CHAN, custom_mqtt_subscriber, 0);
 #endif
+#if defined(CONFIG_APP_POWER)
+ZBUS_CHAN_ADD_OBS(POWER_CHAN, custom_mqtt_subscriber, 0);
+#endif
 #if defined(CONFIG_APP_BUTTON)
 ZBUS_CHAN_ADD_OBS(BUTTON_CHAN, custom_mqtt_subscriber, 0);
 #endif
@@ -857,8 +860,11 @@ static void process_power_data(const struct power_msg *msg)
 	cJSON_AddStringToObject(json, "type", "power");
 	cJSON_AddNumberToObject(json, "sequence", mqtt_ctx.publish_sequence + 1);
 	
-	/* Add power data - use the correct field name from power_msg struct */
+	/* Add comprehensive power data */
 	cJSON_AddNumberToObject(power_data, "percentage", round(msg->percentage * 10) / 10.0);
+	cJSON_AddNumberToObject(power_data, "voltage", round(msg->voltage * 1000) / 1000.0);
+	cJSON_AddNumberToObject(power_data, "current_ma", round(msg->current_ma * 10) / 10.0);
+	cJSON_AddNumberToObject(power_data, "temperature", round(msg->temperature * 10) / 10.0);
 	
 #if defined(CONFIG_APP_POWER_TIMESTAMP)
 	if (msg->timestamp > 0) {
@@ -871,7 +877,8 @@ static void process_power_data(const struct power_msg *msg)
 	/* Use safe publish function */
 	int ret = safe_publish_json(json, "power");
 	if (ret == 0) {
-		LOG_INF("Power data published: %.1f%%", msg->percentage);
+		LOG_INF("Power data published: %.1f%%, %.3fV, %.1fmA, %.1f°C", 
+			msg->percentage, msg->voltage, msg->current_ma, msg->temperature);
 	}
 
 cleanup:
@@ -895,8 +902,19 @@ static void process_button_msg(const struct button_msg *msg)
 		int ret = power_sample_request();
 		if (ret != 0) {
 			LOG_ERR("Failed to request power measurement: %d", ret);
+			return;
+		}
+		
+		/* Get the power data and publish it */
+		struct power_msg power_data;
+		ret = power_get_current_data(&power_data);
+		if (ret == 0) {
+			k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+			process_power_data(&power_data);
+			k_mutex_unlock(&mqtt_ctx.data_mutex);
+			LOG_INF("Button-triggered power data published: %.1f%%", power_data.percentage);
 		} else {
-			LOG_DBG("Power measurement request sent successfully");
+			LOG_ERR("Failed to get power data: %d", ret);
 		}
 	}
 }
@@ -996,6 +1014,24 @@ static void custom_mqtt_thread(void)
 						LOG_WRN("Failed to read ENVIRONMENTAL_CHAN: %d", ret);
 					} else {
 						LOG_DBG("ENVIRONMENTAL_CHAN busy, will retry");
+					}
+				}
+			}
+#endif
+#if defined(CONFIG_APP_POWER)
+			else if (chan == &POWER_CHAN) {
+				struct power_msg msg;
+				ret = zbus_chan_read(&POWER_CHAN, &msg, K_MSEC(100));
+				if (ret == 0) {
+					k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+					process_power_data(&msg);
+					k_mutex_unlock(&mqtt_ctx.data_mutex);
+					LOG_DBG("ZBUS power data processed: %.1f%%", msg.percentage);
+				} else {
+					if (ret != -EBUSY) {
+						LOG_WRN("Failed to read POWER_CHAN: %d", ret);
+					} else {
+						LOG_DBG("POWER_CHAN busy, will retry");
 					}
 				}
 			}

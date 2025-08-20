@@ -8,10 +8,14 @@
 #define _POWER_H_
 
 #include <zephyr/kernel.h>
+#include <zephyr/zbus/zbus.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ZBUS channel for power module communication */
+ZBUS_CHAN_DECLARE(POWER_CHAN);
 
 enum power_msg_type {
 	/* Output message types */
@@ -35,6 +39,15 @@ struct power_msg {
 	/** Contains the current charge of the battery in percentage. */
 	double percentage;
 
+	/** Contains the current battery voltage in volts. */
+	double voltage;
+
+	/** Contains the current battery current in milliamps (positive = charging, negative = discharging). */
+	double current_ma;
+
+	/** Contains the battery temperature in degrees Celsius. */
+	double temperature;
+
 	/** Timestamp of the sample in milliseconds since epoch. */
 	int64_t timestamp;
 };
@@ -48,6 +61,13 @@ struct power_msg {
  * @return 0 on success, negative error code on failure
  */
 int power_sample_request(void);
+
+/** @brief Get current power data
+ *
+ * @param data Pointer to power_msg structure to fill with current data
+ * @return 0 on success, negative error code on failure
+ */
+int power_get_current_data(struct power_msg *data);
 
 #ifdef __cplusplus
 }
