@@ -14,6 +14,9 @@
 extern "C" {
 #endif
 
+/* UART configuration */
+#define UART_RX_BUF_SIZE 256
+
 /* ZBUS channel for UART sensor module communication */
 ZBUS_CHAN_DECLARE(UART_SENSOR_CHAN);
 
@@ -52,6 +55,13 @@ struct uart_sensor_msg {
 
 /* Function declarations */
 
+/** @brief Initialize UART sensor module
+ *
+ * Initializes UART communication for external sensor probes
+ * @return 0 on success, negative error code on failure
+ */
+int uart_sensor_init(void);
+
 /** @brief Request a UART sensor sample and publish the result
  *
  * @return 0 on success, negative error code on failure
@@ -64,6 +74,20 @@ int uart_sensor_sample_request(void);
  * @return 0 on success, negative error code on failure
  */
 int uart_sensor_get_current_data(struct uart_sensor_msg *data);
+
+/** @brief Check UART sensor status
+ *
+ * @return 0 on success, negative error code on failure
+ */
+int uart_sensor_check_status(void);
+
+/** @brief Process UART data line
+ *
+ * Parses a received UART data line and extracts sensor information
+ * @param data The null-terminated string received from UART
+ * @return 0 on success, negative error code on failure
+ */
+int uart_sensor_process_data_line(const char *data);
 
 #ifdef __cplusplus
 }

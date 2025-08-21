@@ -18,6 +18,39 @@
 
 &uart1 {
 	status = "okay";
+	current-speed = <115200>;
+	
+	/* Assign the redefined default and sleep pin configurations. */
+	pinctrl-0 = <&uart1_default>;
+	pinctrl-1 = <&uart1_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	/* Enable the hardware flow control feature in the driver. */
+	hw-flow-control;
+	wakeup-source;
+};
+
+&pinctrl {
+	/* Redefine the board's default active state for uart1 to include flow control pins. */
+	uart1_default: uart1_default {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 0, 5)>,   /* Original TX pin */
+				<NRF_PSEL(UART_RX, 0, 4)>,   /* Original RX pin */
+				<NRF_PSEL(UART_RTS, 0, 23)>, /* New RTS pin */
+				<NRF_PSEL(UART_CTS, 0, 22)>;  /* New CTS pin */
+		};
+	};
+
+	/* Redefine the board's default sleep state for uart1 to include flow control pins. */
+	uart1_sleep: uart1_sleep {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 0, 5)>,
+				<NRF_PSEL(UART_RX, 0, 4)>,
+				<NRF_PSEL(UART_RTS, 0, 23)>,
+				<NRF_PSEL(UART_CTS, 0, 22)>;
+			low-power-enable;
+		};
+	};
 };
 
 
