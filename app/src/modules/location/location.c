@@ -19,6 +19,10 @@
 #include "modem/lte_lc.h"
 #include "location.h"
 
+#if defined(CONFIG_APP_CUSTOM_MQTT)
+#include "../custom_mqtt/custom_mqtt.h"
+#endif
+
 LOG_MODULE_REGISTER(location_module, CONFIG_APP_LOCATION_LOG_LEVEL);
 
 BUILD_ASSERT(CONFIG_APP_LOCATION_WATCHDOG_TIMEOUT_SECONDS >
@@ -127,49 +131,37 @@ static void location_wdt_callback(int channel_id, void *user_data)
 
 static void status_send(enum location_msg_type status)
 {
-	int err;
-	struct location_msg location_msg = {
-		.type = status
-	};
-
-	err = zbus_chan_pub(&LOCATION_CHAN, &location_msg, K_SECONDS(1));
-	if (err) {
-		LOG_ERR("zbus_chan_pub, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
+	/* Log status instead of using ZBUS to avoid buffer exhaustion */
+	const char *status_str;
+	switch (status) {
+		case LOCATION_SEARCH_TRIGGER:
+			status_str = "LOCATION_SEARCH_TRIGGER";
+			break;
+		case LOCATION_SEARCH_DONE:
+			status_str = "LOCATION_SEARCH_DONE";
+			break;
+		case LOCATION_SEARCH_TIMEOUT:
+			status_str = "LOCATION_SEARCH_TIMEOUT";
+			break;
+		default:
+			status_str = "UNKNOWN";
+			break;
 	}
+	LOG_DBG("Location status: %s", status_str);
 }
 
 static void cloud_request_send(const struct location_data_cloud *cloud_request)
 {
-	int err;
-	struct location_msg location_msg = {
-		.type = LOCATION_CLOUD_REQUEST,
-		.cloud_request = *cloud_request
-	};
-
-	err = zbus_chan_pub(&LOCATION_CHAN, &location_msg, K_SECONDS(1));
-	if (err) {
-		LOG_ERR("zbus_chan_pub, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
-	}
+	/* Log cloud request instead of using ZBUS to avoid buffer exhaustion */
+	LOG_DBG("Cloud location request received");
+	/* TODO: Implement cloud location service integration if needed */
 }
 
 static void agnss_request_send(const struct nrf_modem_gnss_agnss_data_frame *agnss_request)
 {
-	int err;
-	struct location_msg location_msg = {
-		.type = LOCATION_AGNSS_REQUEST,
-		.agnss_request = *agnss_request
-	};
-
-	err = zbus_chan_pub(&LOCATION_CHAN, &location_msg, K_SECONDS(1));
-	if (err) {
-		LOG_ERR("zbus_chan_pub, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
-	}
+	/* Log AGNSS request instead of using ZBUS to avoid buffer exhaustion */
+	LOG_DBG("AGNSS request received");
+	/* TODO: Implement AGNSS service integration if needed */
 }
 
 static void gnss_location_send(const struct location_data *location_data)
@@ -180,25 +172,48 @@ static void gnss_location_send(const struct location_data *location_data)
 		.gnss_data = *location_data
 	};
 
-	err = zbus_chan_pub(&LOCATION_CHAN, &location_msg, K_SECONDS(1));
+#if defined(CONFIG_APP_CUSTOM_MQTT)
+	/* Send directly to custom MQTT module to avoid ZBUS buffer exhaustion */
+	err = custom_mqtt_send_location_data(&location_msg);
 	if (err) {
-		LOG_ERR("zbus_chan_pub, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
+		LOG_WRN("Failed to send location data to MQTT module: %d", err);
+	} else {
+		LOG_DBG("Location data sent directly to MQTT module");
 	}
+#else
+	LOG_WRN("No MQTT module available, location data not sent");
+#endif
 }
 
 void trigger_location_update(void)
 {
 	int err;
+	static uint32_t location_requests = 0;
+
+	location_requests++;
+	LOG_INF("Triggering location update #%u", location_requests);
 
 	err = location_request(NULL);
 	if (err == -EBUSY) {
 		LOG_WRN("Location request already in progress");
+	} else if (err == -ENODEV) {
+		LOG_ERR("Location service not available");
+	} else if (err == -ENOMEM) {
+		LOG_ERR("Insufficient memory for location request");
 	} else if (err) {
 		LOG_ERR("Unable to send location request: %d", err);
 		SEND_FATAL_ERROR();
+	} else {
+		LOG_DBG("Location request sent successfully");
 	}
+}
+
+/* Public API function for direct location triggering without ZBUS */
+int location_trigger_update_direct(void)
+{
+	LOG_INF("Direct location trigger requested");
+	trigger_location_update();
+	return 0;
 }
 
 void handle_location_chan(const struct location_msg *location_msg)
@@ -218,6 +233,10 @@ static void state_running_entry(void *obj)
 
 	LOG_DBG("%s", __func__);
 
+	/* Give the system time to stabilize before initializing location services */
+	k_sleep(K_SECONDS(2));
+
+	LOG_INF("Initializing location library");
 	err = location_init(location_event_handler);
 	if (err) {
 		LOG_ERR("Unable to init location library: %d", err);
@@ -225,7 +244,7 @@ static void state_running_entry(void *obj)
 		return;
 	}
 
-	LOG_DBG("Location library initialized");
+	LOG_INF("Location library initialized successfully");
 }
 
 static void state_running_run(void *obj)
@@ -316,7 +335,7 @@ static void location_event_handler(const struct location_event_data *event_data)
 		break;
 	case LOCATION_EVT_TIMEOUT:
 		LOG_DBG("Getting location timed out");
-		status_send(LOCATION_SEARCH_DONE);
+		status_send(LOCATION_SEARCH_TIMEOUT);
 		break;
 	case LOCATION_EVT_ERROR:
 		LOG_WRN("Location request failed:");

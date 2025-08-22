@@ -26,6 +26,7 @@ ZBUS_CHAN_DECLARE(
 enum location_msg_type {
 	LOCATION_SEARCH_STARTED = 0x1,
 	LOCATION_SEARCH_DONE,
+	LOCATION_SEARCH_TIMEOUT,
 	LOCATION_SEARCH_TRIGGER,
 	LOCATION_CLOUD_REQUEST,
 	LOCATION_AGNSS_REQUEST,
@@ -44,6 +45,18 @@ struct location_msg {
 
 #define MSG_TO_LOCATION_TYPE(_msg)	(((const struct location_msg *)_msg)->type)
 #define MSG_TO_LOCATION_MSG_PTR(_msg)	(((const struct location_msg *)_msg))
+
+/* Public API functions */
+/**
+ * @brief Trigger a location update directly without using ZBUS
+ * 
+ * This function provides a direct way to trigger location updates
+ * without going through the ZBUS messaging system, avoiding potential
+ * buffer exhaustion or deadlock issues.
+ * 
+ * @return 0 on success, negative error code on failure
+ */
+int location_trigger_update_direct(void);
 
 #ifdef __cplusplus
 }

@@ -144,6 +144,9 @@ static void sample_sensors(const struct device *const bme680)
 	LOG_DBG("Temperature: %.2f C, Pressure: %.2f Pa, Humidity: %.2f %%",
 		msg.temperature, msg.pressure, msg.humidity);
 
+	/* Add small delay to avoid ZBUS buffer pool contention */
+	k_msleep(50 + (k_cycle_get_32() % 100)); /* 50-150ms random delay */
+
 	err = zbus_chan_pub(&ENVIRONMENTAL_CHAN, &msg, K_NO_WAIT);
 	if (err) {
 		LOG_ERR("zbus_chan_pub, error: %d", err);

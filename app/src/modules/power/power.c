@@ -215,7 +215,7 @@ int power_sample_request(void)
 	}
 	
 	/* Publish data via ZBUS for other modules */
-	ret = zbus_chan_pub(&POWER_CHAN, &current_power_data, K_MSEC(500));
+	ret = zbus_chan_pub(&POWER_CHAN, &current_power_data, K_NO_WAIT);
 	if (ret != 0) {
 		LOG_WRN("Failed to publish power data via ZBUS: %d", ret);
 		/* Don't fail the function, just log the warning */

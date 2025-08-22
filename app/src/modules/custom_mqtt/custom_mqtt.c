@@ -25,6 +25,8 @@
 
 #if defined(CONFIG_APP_LOCATION)
 #include "location.h"
+#include <nrf_modem_at.h>
+#include <modem/location.h>
 #endif
 
 #if defined(CONFIG_APP_ENVIRONMENTAL)
@@ -80,6 +82,9 @@ static struct {
 	enum mqtt_state state;
 	struct k_work_delayable connect_work;
 	struct k_work_delayable data_send_work;
+#if defined(CONFIG_APP_LOCATION)
+	struct k_work_delayable location_trigger_work;
+#endif
 	bool network_connected;
 	struct mqtt_utf8 username;
 	struct mqtt_utf8 password;
@@ -103,9 +108,6 @@ ZBUS_MSG_SUBSCRIBER_DEFINE(custom_mqtt_subscriber);
 
 /* Subscribe to channels */
 ZBUS_CHAN_ADD_OBS(NETWORK_CHAN, custom_mqtt_subscriber, 0);
-#if defined(CONFIG_APP_LOCATION)
-ZBUS_CHAN_ADD_OBS(LOCATION_CHAN, custom_mqtt_subscriber, 0);
-#endif
 #if defined(CONFIG_APP_ENVIRONMENTAL)
 ZBUS_CHAN_ADD_OBS(ENVIRONMENTAL_CHAN, custom_mqtt_subscriber, 0);
 #endif
@@ -132,6 +134,7 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 			      const struct mqtt_evt *evt);
 static void connect_work_handler(struct k_work *work);
 static void data_send_work_handler(struct k_work *work);
+static void location_trigger_work_handler(struct k_work *work);
 static int custom_mqtt_connect(void);
 static int custom_mqtt_disconnect(void);
 static int mqtt_publish_data(const char *data, size_t len);
@@ -140,6 +143,11 @@ static int mqtt_publish_data(const char *data, size_t len);
 static bool validate_sensor_data(double value, double min, double max);
 static bool validate_json_string(const char *json_str);
 static int safe_publish_json(cJSON *json, const char *data_type);
+
+/* Location trigger functionality */
+#if defined(CONFIG_APP_LOCATION)
+static void trigger_location_request(void);
+#endif
 
 /* Message processing functions */
 static void process_network_msg(const struct network_msg *msg);
@@ -155,7 +163,7 @@ static void process_power_data(const struct power_msg *msg);
 #if defined(CONFIG_APP_UART_SENSOR)
 static void process_uart_sensor_data(const struct uart_sensor_msg *msg);
 #endif
-#if defined(CONFIG_APP_BUTTON) && defined(MQTT_BUTTON_POWER_MEASUREMENT_ENABLED)
+#if defined(CONFIG_APP_BUTTON)
 static void process_button_msg(const struct button_msg *msg);
 #endif
 
@@ -243,8 +251,27 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 					cJSON *command = cJSON_GetObjectItem(received_json, "command");
 					if (command && cJSON_IsString(command)) {
 						LOG_INF("Processing command: %s", command->valuestring);
+						
+						if (strcmp(command->valuestring, "get_location") == 0) {
+							LOG_INF("Location request received via MQTT");
+#if defined(CONFIG_APP_LOCATION)
+							trigger_location_request();
+							cJSON_AddStringToObject(response, "status", "location_requested");
+#else
+							LOG_WRN("Location module not enabled");
+							cJSON_AddStringToObject(response, "status", "location_not_available");
+#endif
+						} else if (strcmp(command->valuestring, "get_status") == 0) {
+							LOG_INF("Status request received via MQTT");
+							cJSON_AddStringToObject(response, "status", "online");
+							cJSON_AddNumberToObject(response, "uptime_ms", k_uptime_get());
+							cJSON_AddNumberToObject(response, "mqtt_state", mqtt_ctx.state);
+							cJSON_AddBoolToObject(response, "network_connected", mqtt_ctx.network_connected);
+						} else {
+							cJSON_AddStringToObject(response, "status", "unknown_command");
+						}
+						
 						cJSON_AddStringToObject(response, "command_processed", command->valuestring);
-						cJSON_AddStringToObject(response, "status", "command_received");
 					}
 					cJSON_Delete(received_json);
 				} else {
@@ -570,6 +597,76 @@ static int safe_publish_json(cJSON *json, const char *data_type)
 	
 	return ret;
 }
+/* Location trigger functionality */
+#if defined(CONFIG_APP_LOCATION)
+
+static void trigger_location_request(void)
+{
+	static bool first_request = true;
+	
+	/* Add startup delay for the first location request to ensure system stability */
+	if (first_request) {
+		int64_t uptime = k_uptime_get();
+		if (uptime < 10000) { /* Less than 10 seconds uptime */
+			LOG_INF("System uptime too short (%lld ms), delaying location request", uptime);
+			return;
+		}
+		first_request = false;
+	}
+	
+	LOG_INF("Triggering location request via direct API (bypassing ZBUS)");
+	
+	/* Use direct API call instead of ZBUS to avoid buffer exhaustion */
+	int err = location_trigger_update_direct();
+	if (err) {
+		LOG_ERR("Failed to trigger location request: %d", err);
+	} else {
+		LOG_INF("Location search triggered successfully");
+	}
+}
+
+static void location_trigger_work_handler(struct k_work *work)
+{
+	static uint32_t location_request_count = 0;
+	
+	if (mqtt_ctx.state == MQTT_STATE_CONNECTED && mqtt_ctx.network_connected) {
+		location_request_count++;
+		LOG_INF("Triggering periodic location update #%u", location_request_count);
+		trigger_location_request();
+	} else {
+		LOG_DBG("Skipping location update - MQTT not ready (state: %d, network: %d)", 
+			mqtt_ctx.state, mqtt_ctx.network_connected);
+	}
+	
+	/* Schedule next location update */
+	k_work_schedule(&mqtt_ctx.location_trigger_work, 
+			K_SECONDS(MQTT_LOCATION_UPDATE_INTERVAL_SEC));
+}
+#endif
+
+#if defined(CONFIG_APP_LOCATION)
+/* Public API function to receive location data directly (avoiding ZBUS circular dependency) */
+int custom_mqtt_send_location_data(const struct location_msg *location_data)
+{
+	if (!location_data) {
+		LOG_ERR("Invalid location data pointer");
+		return -EINVAL;
+	}
+	
+	if (mqtt_ctx.state != MQTT_STATE_CONNECTED) {
+		LOG_WRN("MQTT not connected, cannot process location data");
+		return -ENOTCONN;
+	}
+	
+	LOG_INF("Received location data via direct API call");
+	
+	k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+	process_location_data(location_data);
+	k_mutex_unlock(&mqtt_ctx.data_mutex);
+	
+	return 0;
+}
+#endif
 
 /* State machine implementations */
 static void idle_entry(void *obj)
@@ -673,6 +770,12 @@ static void connected_entry(void *obj)
 	
 	/* Start periodic data sending */
 	k_work_schedule(&mqtt_ctx.data_send_work, K_SECONDS(10));
+	
+#if defined(CONFIG_APP_LOCATION)
+	/* Temporarily disable automatic location updates to debug heap issues */
+	LOG_INF("Location support enabled but automatic updates disabled for debugging");
+	// k_work_schedule(&mqtt_ctx.location_trigger_work, K_SECONDS(60));
+#endif
 }
 
 static void connected_run(void *obj)
@@ -703,6 +806,13 @@ static void disconnecting_entry(void *obj)
 {
 	LOG_DBG("Entering MQTT disconnecting state");
 	mqtt_ctx.state = MQTT_STATE_DISCONNECTING;
+	
+	/* Cancel ongoing work */
+	k_work_cancel_delayable(&mqtt_ctx.data_send_work);
+#if defined(CONFIG_APP_LOCATION)
+	k_work_cancel_delayable(&mqtt_ctx.location_trigger_work);
+#endif
+	
 	custom_mqtt_disconnect();
 }
 
@@ -718,6 +828,9 @@ static void error_entry(void *obj)
 	
 	/* Cancel any pending work */
 	k_work_cancel_delayable(&mqtt_ctx.data_send_work);
+#if defined(CONFIG_APP_LOCATION)
+	k_work_cancel_delayable(&mqtt_ctx.location_trigger_work);
+#endif
 	
 	/* Reset failure counters for exponential backoff */
 	static uint32_t reconnect_delay = MQTT_RECONNECT_BASE_DELAY_SEC;
@@ -744,53 +857,150 @@ static void error_run(void *obj)
 #if defined(CONFIG_APP_LOCATION)
 static void process_location_data(const struct location_msg *msg)
 {
-	cJSON *json = cJSON_CreateObject();
-	cJSON *location = cJSON_CreateObject();
+	cJSON *json = NULL;
+	cJSON *location_data = NULL;
+	cJSON *location_details = NULL;
+	char *json_string = NULL;
+	int ret = 0;
 	
-	if (json == NULL || location == NULL) {
-		LOG_ERR("Failed to create JSON objects");
+	if (!msg) {
+		LOG_ERR("Invalid location message");
+		return;
+	}
+	
+	LOG_DBG("Processing location message type %d", msg->type);
+	
+	/* Only process actual location data */
+	if (msg->type != LOCATION_GNSS_DATA) {
+		LOG_DBG("Received location message type %d, not publishing", msg->type);
+		return;
+	}
+	
+	/* Additional safety check for GNSS data validity */
+	if (!isfinite(msg->gnss_data.latitude) || !isfinite(msg->gnss_data.longitude) || 
+	    !isfinite(msg->gnss_data.accuracy)) {
+		LOG_ERR("Location data contains invalid values, skipping");
+		return;
+	}
+	
+	/* Validate location data with production-level checks */
+	if (!validate_sensor_data(msg->gnss_data.latitude, -90.0, 90.0)) {
+		LOG_WRN("Invalid latitude: %.6f, skipping location data", 
+			msg->gnss_data.latitude);
+		return;
+	}
+	
+	if (!validate_sensor_data(msg->gnss_data.longitude, -180.0, 180.0)) {
+		LOG_WRN("Invalid longitude: %.6f, skipping location data", 
+			msg->gnss_data.longitude);
+		return;
+	}
+	
+	if ((double)msg->gnss_data.accuracy > MQTT_GPS_ACCURACY_MAX_METERS || 
+	    msg->gnss_data.accuracy <= 0.0f) {
+		LOG_WRN("GPS accuracy out of range: %.2f m, skipping", 
+			(double)msg->gnss_data.accuracy);
+		return;
+	}
+	
+	/* Create JSON structure */
+	json = cJSON_CreateObject();
+	location_data = cJSON_CreateObject();
+	location_details = cJSON_CreateObject();
+	
+	if (!json || !location_data || !location_details) {
+		LOG_ERR("Failed to create JSON objects for location data");
 		goto cleanup;
 	}
-
-	/* Validate location data */
-	if (msg->gnss_data.latitude < -90.0 || msg->gnss_data.latitude > 90.0 ||
-	    msg->gnss_data.longitude < -180.0 || msg->gnss_data.longitude > 180.0) {
-		LOG_WRN("Invalid GPS coordinates: lat=%.6f, lng=%.6f, skipping",
-			msg->gnss_data.latitude, msg->gnss_data.longitude);
-		goto cleanup;
-	}
-
-	if (msg->gnss_data.accuracy > MQTT_GPS_ACCURACY_MAX_METERS) {
-		LOG_WRN("GPS accuracy too low: %.2f m, skipping", msg->gnss_data.accuracy);
-		goto cleanup;
-	}
-
-	/* Add device info and type */
+	
+	/* Add main message structure */
 	cJSON_AddStringToObject(json, "device_id", MQTT_CLIENT_ID);
 	cJSON_AddStringToObject(json, "type", "location");
 	cJSON_AddNumberToObject(json, "timestamp", k_uptime_get());
-	cJSON_AddNumberToObject(json, "sequence", mqtt_ctx.publish_sequence + 1);
+	cJSON_AddNumberToObject(json, "sequence", ++mqtt_ctx.publish_sequence);
 	
-	/* Add location data */
-	cJSON_AddNumberToObject(location, "lat", msg->gnss_data.latitude);
-	cJSON_AddNumberToObject(location, "lng", msg->gnss_data.longitude);
-	cJSON_AddNumberToObject(location, "acc", msg->gnss_data.accuracy);
-	cJSON_AddItemToObject(json, "data", location);
+	/* Add location coordinates with proper precision */
+	cJSON_AddNumberToObject(location_data, "latitude", 
+		round(msg->gnss_data.latitude * 1000000.0) / 1000000.0);
+	cJSON_AddNumberToObject(location_data, "longitude", 
+		round(msg->gnss_data.longitude * 1000000.0) / 1000000.0);
+	cJSON_AddNumberToObject(location_data, "accuracy", 
+		round((double)msg->gnss_data.accuracy * 10.0) / 10.0);
 	
-	char *json_string = cJSON_Print(json);
-	if (json_string != NULL) {
-		if (mqtt_ctx.state == MQTT_STATE_CONNECTED) {
-			int ret = mqtt_publish_data(json_string, strlen(json_string));
-			if (ret == 0) {
-				LOG_INF("Location data published: lat=%.6f, lng=%.6f, acc=%.2f",
-					msg->gnss_data.latitude, msg->gnss_data.longitude, 
-					msg->gnss_data.accuracy);
-			}
+	/* Add location method information */
+	cJSON_AddStringToObject(location_details, "method", "gnss");
+	
+	/* Add timestamp if available */
+	if (msg->gnss_data.datetime.valid) {
+		int64_t unix_time_ms = 0;
+		date_time_now(&unix_time_ms);
+		cJSON_AddNumberToObject(location_details, "fix_timestamp", unix_time_ms);
+		cJSON_AddBoolToObject(location_details, "time_valid", true);
+	} else {
+		cJSON_AddBoolToObject(location_details, "time_valid", false);
+	}
+	
+	/* Add additional GNSS details if available */
+	#if defined(CONFIG_LOCATION_DATA_DETAILS)
+	/* Check if location details are available by checking method */
+	const struct location_data_details *details = &msg->gnss_data.details;
+	if (details->gnss.satellites_tracked > 0) {
+		cJSON_AddNumberToObject(location_details, "satellites_tracked", 
+			details->gnss.satellites_tracked);
+	}
+	if (details->gnss.satellites_used > 0) {
+		cJSON_AddNumberToObject(location_details, "satellites_used", 
+			details->gnss.satellites_used);
+	}
+	if (details->elapsed_time_method > 0) {
+		cJSON_AddNumberToObject(location_details, "ttff_ms", 
+			details->elapsed_time_method);
+	}
+	#endif
+	
+	/* Assemble final JSON structure */
+	cJSON_AddItemToObject(location_data, "details", location_details);
+	location_details = NULL; /* Ownership transferred */
+	cJSON_AddItemToObject(json, "data", location_data);
+	location_data = NULL; /* Ownership transferred */
+	
+	/* Convert to string and validate */
+	json_string = cJSON_Print(json);
+	if (!json_string) {
+		LOG_ERR("Failed to serialize location JSON");
+		goto cleanup;
+	}
+	
+	if (!validate_json_string(json_string)) {
+		LOG_ERR("Generated invalid JSON for location data");
+		goto cleanup;
+	}
+	
+	/* Publish if connected */
+	if (mqtt_ctx.state == MQTT_STATE_CONNECTED) {
+		ret = mqtt_publish_data(json_string, strlen(json_string));
+		if (ret == 0) {
+			LOG_INF("Location published: lat=%.6f, lng=%.6f, acc=%.1fm, method=gnss",
+				msg->gnss_data.latitude, msg->gnss_data.longitude, 
+				(double)msg->gnss_data.accuracy);
+		} else {
+			LOG_ERR("Failed to publish location data: %d", ret);
+			mqtt_ctx.publish_failures++;
 		}
-		cJSON_free(json_string);
+	} else {
+		LOG_WRN("MQTT not connected, discarding location data");
 	}
 
 cleanup:
+	if (json_string) {
+		cJSON_free(json_string);
+	}
+	if (location_details) {
+		cJSON_Delete(location_details);
+	}
+	if (location_data) {
+		cJSON_Delete(location_data);
+	}
 	if (json) {
 		cJSON_Delete(json);
 	}
@@ -985,45 +1195,59 @@ cleanup:
 }
 #endif
 
-#if defined(CONFIG_APP_BUTTON) && defined(MQTT_BUTTON_POWER_MEASUREMENT_ENABLED)
+#if defined(CONFIG_APP_BUTTON)
 static void process_button_msg(const struct button_msg *msg)
 {
 	LOG_INF("Button %d %s detected", msg->button_number, 
 		msg->type == BUTTON_PRESS_SHORT ? "short press" : "long press");
 	
-	/* Only handle button 1 short press for power measurement trigger */
-	if (msg->button_number == 1 && msg->type == BUTTON_PRESS_SHORT) {
-		LOG_INF("Requesting power measurement via button press");
-		
-		/* Request power measurement directly */
-		int ret = power_sample_request();
-		if (ret != 0) {
-			LOG_ERR("Failed to request power measurement: %d", ret);
-			return;
-		}
-		
-		/* Get the power data and publish it */
-		struct power_msg power_data;
-		ret = power_get_current_data(&power_data);
-		if (ret == 0) {
-			k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
-			process_power_data(&power_data);
-			k_mutex_unlock(&mqtt_ctx.data_mutex);
-			LOG_INF("Button-triggered power data published: %.1f%%", power_data.percentage);
-		} else {
-			LOG_ERR("Failed to get power data: %d", ret);
-		}
+	if (msg->button_number == 1) {
+		if (msg->type == BUTTON_PRESS_SHORT) {
+			/* Short press: trigger power measurement */
+			LOG_INF("Requesting power measurement via button short press");
+			
+			/* Request power measurement directly */
+			int ret = power_sample_request();
+			if (ret != 0) {
+				LOG_ERR("Failed to request power measurement: %d", ret);
+				return;
+			}
+			
+			/* Get the power data and publish it */
+			struct power_msg power_data;
+			ret = power_get_current_data(&power_data);
+			if (ret == 0) {
+				k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+				process_power_data(&power_data);
+				k_mutex_unlock(&mqtt_ctx.data_mutex);
+				LOG_INF("Button-triggered power data published: %.1f%%", power_data.percentage);
+			} else {
+				LOG_ERR("Failed to get power data: %d", ret);
+			}
 
 #if defined(CONFIG_APP_UART_SENSOR)
-		/* Also trigger UART sensor data generation */
-		LOG_INF("Requesting UART sensor data via button press");
-		ret = uart_sensor_sample_request();
-		if (ret != 0) {
-			LOG_ERR("Failed to request UART sensor data: %d", ret);
-		} else {
-			LOG_INF("UART sensor data request triggered successfully");
-		}
+			/* Also trigger UART sensor data generation */
+			LOG_INF("Requesting UART sensor data via button press");
+			ret = uart_sensor_sample_request();
+			if (ret != 0) {
+				LOG_ERR("Failed to request UART sensor data: %d", ret);
+			} else {
+				LOG_INF("UART sensor data request triggered successfully");
+			}
 #endif
+		} else if (msg->type == BUTTON_PRESS_LONG) {
+			/* Long press: trigger location request */
+			LOG_INF("Requesting location update via button long press");
+			
+#if defined(CONFIG_APP_LOCATION)
+			trigger_location_request();
+			LOG_INF("Location request triggered via button long press");
+#else
+			LOG_WRN("Location module not enabled - cannot process location request");
+#endif
+		}
+	} else {
+		LOG_DBG("Ignoring button %d press (only button 1 is handled)", msg->button_number);
 	}
 }
 #endif
@@ -1095,19 +1319,6 @@ static void custom_mqtt_thread(void)
 					LOG_WRN("Failed to read NETWORK_CHAN: %d", ret);
 				}
 			}
-#if defined(CONFIG_APP_LOCATION)
-			else if (chan == &LOCATION_CHAN) {
-				struct location_msg msg;
-				ret = zbus_chan_read(&LOCATION_CHAN, &msg, K_MSEC(100));
-				if (ret == 0) {
-					k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
-					process_location_data(&msg);
-					k_mutex_unlock(&mqtt_ctx.data_mutex);
-				} else {
-					LOG_WRN("Failed to read LOCATION_CHAN: %d", ret);
-				}
-			}
-#endif
 #if defined(CONFIG_APP_ENVIRONMENTAL)
 			else if (chan == &ENVIRONMENTAL_CHAN) {
 				struct environmental_msg msg;
@@ -1163,7 +1374,7 @@ static void custom_mqtt_thread(void)
 				}
 			}
 #endif
-#if defined(CONFIG_APP_BUTTON) && defined(MQTT_BUTTON_POWER_MEASUREMENT_ENABLED)
+#if defined(CONFIG_APP_BUTTON)
 			else if (chan == &BUTTON_CHAN) {
 				struct button_msg msg;
 				ret = zbus_chan_read(&BUTTON_CHAN, &msg, K_MSEC(100));
@@ -1203,6 +1414,9 @@ static int custom_mqtt_init(void)
 	/* Initialize work queue */
 	k_work_init_delayable(&mqtt_ctx.connect_work, connect_work_handler);
 	k_work_init_delayable(&mqtt_ctx.data_send_work, data_send_work_handler);
+#if defined(CONFIG_APP_LOCATION)
+	k_work_init_delayable(&mqtt_ctx.location_trigger_work, location_trigger_work_handler);
+#endif
 	
 	/* Initialize counters */
 	mqtt_ctx.publish_sequence = 0;

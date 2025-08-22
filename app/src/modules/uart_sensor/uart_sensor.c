@@ -232,7 +232,7 @@ static void publish_error_message(enum uart_sensor_error_type error_type, const 
 		error_msg.error_details[sizeof(error_msg.error_details) - 1] = '\0';
 	}
 	
-	int ret = zbus_chan_pub(&UART_SENSOR_CHAN, &error_msg, K_MSEC(UART_ZBUS_TIMEOUT_MS));
+	int ret = zbus_chan_pub(&UART_SENSOR_CHAN, &error_msg, K_NO_WAIT);
 	if (ret != 0) {
 		LOG_ERR("Failed to publish error message: %d", ret);
 		uart_module_state.stats.publish_errors++;
@@ -644,7 +644,7 @@ int uart_sensor_sample_request(void)
 	k_mutex_unlock(&uart_data_mutex);
 	
 	/* Publish the current data via ZBUS */
-	int ret = zbus_chan_pub(&UART_SENSOR_CHAN, &data_to_publish, K_MSEC(UART_ZBUS_TIMEOUT_MS));
+	int ret = zbus_chan_pub(&UART_SENSOR_CHAN, &data_to_publish, K_NO_WAIT);
 	if (ret != 0) {
 		LOG_ERR("Failed to publish UART sensor data: %d", ret);
 		uart_module_state.stats.publish_errors++;

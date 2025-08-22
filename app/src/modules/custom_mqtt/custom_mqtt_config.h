@@ -31,6 +31,7 @@ extern "C" {
 #define MQTT_MAX_PUBLISH_FAILURES       10
 #define MQTT_HEARTBEAT_INTERVAL_SEC     30
 #define MQTT_CONNECTION_TIMEOUT_SEC     30
+#define MQTT_LOCATION_UPDATE_INTERVAL_SEC 300  /* 5 minutes between location updates */
 
 /* Data precision limits (to reduce JSON size and noise) */
 #define MQTT_TEMP_PRECISION_DECIMALS    2

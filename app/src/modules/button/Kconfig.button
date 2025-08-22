@@ -4,6 +4,15 @@
 # SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
 #
 
+config APP_BUTTON
+	bool "Button module"
+	default y
+	select GPIO
+	help
+	  Enable the button module for detecting button presses.
+
+if APP_BUTTON
+
 menu "Button"
 
 config APP_BUTTON_SHELL
@@ -25,3 +34,5 @@ module-str = Button
 source "subsys/logging/Kconfig.template.log_config"
 
 endmenu # Button
+
+endif # APP_BUTTON

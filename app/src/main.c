@@ -316,7 +316,7 @@ static void sensor_and_poll_triggers_send(void)
 		.type = CUSTOM_MQTT_EVT_DATA_SEND
 	};
 
-	err = zbus_chan_pub(&CUSTOM_MQTT_CHAN, &mqtt_msg, K_SECONDS(1));
+	err = zbus_chan_pub(&CUSTOM_MQTT_CHAN, &mqtt_msg, K_NO_WAIT);
 	if (err) {
 		LOG_ERR("zbus_chan_pub MQTT trigger, error: %d", err);
 		SEND_FATAL_ERROR();
@@ -329,7 +329,7 @@ static void sensor_and_poll_triggers_send(void)
 		.type = NETWORK_QUALITY_SAMPLE_REQUEST,
 	};
 
-	err = zbus_chan_pub(&NETWORK_CHAN, &network_msg, K_SECONDS(1));
+	err = zbus_chan_pub(&NETWORK_CHAN, &network_msg, K_NO_WAIT);
 	if (err) {
 		LOG_ERR("zbus_chan_pub, error: %d", err);
 		SEND_FATAL_ERROR();
@@ -347,16 +347,20 @@ static void sensor_and_poll_triggers_send(void)
 #endif /* CONFIG_APP_POWER */
 
 #if defined(CONFIG_APP_ENVIRONMENTAL)
+	/* Temporarily disable environmental sampling to debug ZBUS buffer issues */
+	LOG_INF("Environmental sampling temporarily disabled for debugging");
+	/*
 	struct environmental_msg environmental_msg = {
 		.type = ENVIRONMENTAL_SENSOR_SAMPLE_REQUEST,
 	};
 
-	err = zbus_chan_pub(&ENVIRONMENTAL_CHAN, &environmental_msg, K_SECONDS(1));
+	err = zbus_chan_pub(&ENVIRONMENTAL_CHAN, &environmental_msg, K_NO_WAIT);
 	if (err) {
 		LOG_ERR("zbus_chan_pub, error: %d", err);
 		SEND_FATAL_ERROR();
 		return;
 	}
+	*/
 #endif /* CONFIG_APP_ENVIRONMENTAL */
 
 #if defined(CONFIG_APP_UART_SENSOR)
@@ -364,7 +368,7 @@ static void sensor_and_poll_triggers_send(void)
 		.type = UART_SENSOR_DATA_REQUEST,
 	};
 
-	err = zbus_chan_pub(&UART_SENSOR_CHAN, &uart_sensor_msg, K_SECONDS(1));
+	err = zbus_chan_pub(&UART_SENSOR_CHAN, &uart_sensor_msg, K_NO_WAIT);
 	if (err) {
 		LOG_ERR("zbus_chan_pub UART sensor trigger, error: %d", err);
 		SEND_FATAL_ERROR();
@@ -376,7 +380,7 @@ static void sensor_and_poll_triggers_send(void)
 	/* Send FOTA poll trigger */
 	enum fota_msg_type fota_msg = FOTA_POLL_REQUEST;
 
-	err = zbus_chan_pub(&FOTA_CHAN, &fota_msg, K_SECONDS(1));
+	err = zbus_chan_pub(&FOTA_CHAN, &fota_msg, K_NO_WAIT);
 	if (err) {
 		LOG_ERR("zbus_chan_pub FOTA trigger, error: %d", err);
 		SEND_FATAL_ERROR();
@@ -393,7 +397,7 @@ static void timer_work_fn(struct k_work *work)
 
 	ARG_UNUSED(work);
 
-	err = zbus_chan_pub(&TIMER_CHAN, &dummy, K_SECONDS(1));
+	err = zbus_chan_pub(&TIMER_CHAN, &dummy, K_NO_WAIT);
 	if (err) {
 		LOG_ERR("zbus_chan_pub, error: %d", err);
 		SEND_FATAL_ERROR();
@@ -603,12 +607,20 @@ static void sample_data_entry(void *o)
 	state_object->sample_start_time = k_uptime_seconds();
 
 #if defined(CONFIG_APP_LOCATION)
+	/* Temporarily disable automatic location requests to debug heap issues */
+	LOG_INF("Location module available but automatic requests disabled for debugging");
+	/* Continue to sensor data collection without location trigger */
+	sensor_and_poll_triggers_send();
+	smf_set_state(SMF_CTX(state_object), &states[STATE_WAIT_FOR_TRIGGER]);
+	
+	/* Original code that causes heap corruption:
 	err = zbus_chan_pub(&LOCATION_CHAN, &location_msg, K_SECONDS(1));
 	if (err) {
 		LOG_ERR("zbus_chan_pub data sample trigger, error: %d", err);
 		SEND_FATAL_ERROR();
 		return;
 	}
+	*/
 #else
 	/* If location is disabled, immediately trigger sensor data collection and continue */
 	LOG_INF("Location module disabled, proceeding directly to sensor data collection");

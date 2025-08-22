@@ -59,6 +59,19 @@ struct custom_mqtt_msg {
 /* Declare zbus channel for custom MQTT */
 ZBUS_CHAN_DECLARE(CUSTOM_MQTT_CHAN);
 
+#if defined(CONFIG_APP_LOCATION)
+/* Forward declaration for location data */
+struct location_msg;
+
+/**
+ * @brief Send location data directly to MQTT module (avoids ZBUS circular dependency)
+ * 
+ * @param location_data Pointer to location message data
+ * @return 0 on success, negative error code on failure
+ */
+int custom_mqtt_send_location_data(const struct location_msg *location_data);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
