@@ -8,37 +8,54 @@ menuconfig APP_UART_SENSOR
 	bool "UART sensor module"
 	default y
 	help
-	  Enable UART sensor communication module for external sensor data.
+	  Enable UART sensor module for external probe communication.
 
 if APP_UART_SENSOR
 
-module = APP_UART_SENSOR
-module-str = UART sensor
-source "subsys/logging/Kconfig.template.log_config"
-
-config APP_UART_SENSOR_THREAD_STACK_SIZE
-	int "UART sensor module thread stack size"
-	default 4096
-	help
-	  Stack size for the UART sensor module thread
-
-config APP_UART_SENSOR_MSG_PROCESSING_TIMEOUT_SECONDS
-	int "UART sensor message processing timeout"
-	default 5
-	range 1 3600
-	help
-	  Timeout for processing UART sensor messages in seconds
-
-config APP_UART_SENSOR_WATCHDOG_TIMEOUT_SECONDS
-	int "UART sensor module watchdog timeout"
-	default 120
-	help
-	  Watchdog timeout for UART sensor module in seconds
-
-config APP_UART_SENSOR_TIMESTAMP
-	bool "UART sensor timestamp"
+config APP_UART_SENSOR_FORMAT_PROBE_ID
+	bool "Format probe ID as MAC-style hex"
 	default y
 	help
-	  Include timestamp in UART sensor messages
+	  When enabled, probe IDs are formatted as MAC-style hex addresses
+	  (e.g., "41:42:43:44:45:46:47:48:...").
+	  When disabled, raw probe names are used as received from UART
+	  (e.g., "MySensor" instead of "nRF_52840_MySensor").
+	  
+	  This is useful when you want human-readable probe names in your
+	  MQTT messages instead of hex-encoded identifiers.
+
+config APP_UART_SENSOR_DATA_MAX_AGE_MS
+	int "Maximum age of sensor data before it's considered stale (ms)"
+	default 300000
+	range 10000 3600000
+	help
+	  Sensor data older than this value will be considered stale and
+	  not published on button press or periodic requests.
+
+config APP_UART_SENSOR_THREAD_STACK_SIZE
+	int "UART sensor processing thread stack size"
+	default 2048
+	range 1024 8192
+	help
+	  Stack size for the background UART sensor processing thread.
+
+config APP_UART_SENSOR_THREAD_PRIORITY
+	int "UART sensor processing thread priority"
+	default 5
+	range 1 10
+	help
+	  Priority for the background UART sensor processing thread.
+	  Lower values mean higher priority.
+
+config APP_UART_SENSOR_MSG_QUEUE_SIZE
+	int "UART message queue size"
+	default 10
+	range 5 50
+	help
+	  Number of UART messages that can be queued for processing.
+
+module = APP_UART_SENSOR
+module-str = UART sensor module
+source "subsys/logging/Kconfig.template.log_config"
 
 endif # APP_UART_SENSOR

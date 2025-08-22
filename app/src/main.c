@@ -360,16 +360,10 @@ static void sensor_and_poll_triggers_send(void)
 #endif /* CONFIG_APP_ENVIRONMENTAL */
 
 #if defined(CONFIG_APP_UART_SENSOR)
-	struct uart_sensor_msg uart_sensor_msg = {
-		.type = UART_SENSOR_DATA_REQUEST,
-	};
-
-	err = zbus_chan_pub(&UART_SENSOR_CHAN, &uart_sensor_msg, K_SECONDS(1));
-	if (err) {
-		LOG_ERR("zbus_chan_pub UART sensor trigger, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
-	}
+	/* UART sensor data is processed automatically via background thread.
+	 * Periodic triggering disabled to prevent empty message spam.
+	 * Data is published automatically when received from external probe. */
+	LOG_DBG("UART sensor: automatic processing active, no periodic trigger needed");
 #endif /* CONFIG_APP_UART_SENSOR */
 
 #if defined(CONFIG_APP_FOTA)

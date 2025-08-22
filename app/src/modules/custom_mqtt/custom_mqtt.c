@@ -997,10 +997,12 @@ static void process_button_msg(const struct button_msg *msg)
 		/* Also trigger UART sensor data generation */
 		LOG_INF("Requesting UART sensor data via button press");
 		ret = uart_sensor_sample_request();
-		if (ret != 0) {
+		if (ret == -ENODATA) {
+			LOG_INF("No fresh UART sensor data available - skipping");
+		} else if (ret != 0) {
 			LOG_ERR("Failed to request UART sensor data: %d", ret);
 		} else {
-			LOG_INF("UART sensor data request triggered successfully");
+			LOG_INF("UART sensor data published successfully");
 		}
 #endif
 	}
