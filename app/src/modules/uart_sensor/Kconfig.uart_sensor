@@ -7,8 +7,12 @@
 menuconfig APP_UART_SENSOR
 	bool "UART sensor module"
 	default y
+	select UART_INTERRUPT_DRIVEN
+	depends on SERIAL
 	help
 	  Enable UART sensor communication module for external sensor data.
+	  This module provides communication with external sensor probes via UART
+	  and publishes sensor data through ZBUS channels.
 
 if APP_UART_SENSOR
 
@@ -16,29 +20,338 @@ module = APP_UART_SENSOR
 module-str = UART sensor
 source "subsys/logging/Kconfig.template.log_config"
 
-config APP_UART_SENSOR_THREAD_STACK_SIZE
-	int "UART sensor module thread stack size"
-	default 4096
-	help
-	  Stack size for the UART sensor module thread
+menu "UART Communication Settings"
 
-config APP_UART_SENSOR_MSG_PROCESSING_TIMEOUT_SECONDS
-	int "UART sensor message processing timeout"
-	default 5
-	range 1 3600
+config APP_UART_SENSOR_RX_BUFFER_SIZE
+	int "UART receive buffer size"
+	default 256
+	range 64 1024
 	help
-	  Timeout for processing UART sensor messages in seconds
+	  Size of the UART receive buffer for incoming data.
+	  Larger buffers can handle longer sensor messages but consume more RAM.
 
-config APP_UART_SENSOR_WATCHDOG_TIMEOUT_SECONDS
-	int "UART sensor module watchdog timeout"
-	default 120
+config APP_UART_SENSOR_LINE_BUFFER_SIZE
+	int "UART line buffer size"
+	default 128
+	range 64 512
 	help
-	  Watchdog timeout for UART sensor module in seconds
+	  Size of the buffer for assembling complete lines from UART data.
+	  Must be large enough to hold the longest expected sensor message.
 
-config APP_UART_SENSOR_TIMESTAMP
-	bool "UART sensor timestamp"
+config APP_UART_SENSOR_MSG_QUEUE_SIZE
+	int "UART message queue size"
+	default 10
+	range 5 50
+	help
+	  Number of UART messages that can be queued for processing.
+	  Larger queues prevent data loss during high-frequency transmissions.
+
+config APP_UART_SENSOR_DEVICE_SETTLE_DELAY_MS
+	int "UART device stabilization delay (ms)"
+	default 10
+	range 1 100
+	help
+	  Delay after UART device power-on to allow hardware stabilization.
+
+config APP_UART_SENSOR_ENABLE_FLOW_CONTROL
+	bool "Enable UART flow control"
+	default n
+	help
+	  Enable hardware flow control (RTS/CTS) for UART communication.
+	  Useful for reliable communication at high data rates.
+
+config APP_UART_SENSOR_POWER_MANAGEMENT
+	bool "Enable UART power management"
 	default y
 	help
-	  Include timestamp in UART sensor messages
+	  Enable power management features for the UART device.
+	  This allows the UART to enter low-power states when not in use.
+
+endmenu # UART Communication Settings
+
+menu "Threading and Performance"
+
+config APP_UART_SENSOR_THREAD_STACK_SIZE
+	int "UART sensor module thread stack size"
+	default 2048
+	range 1024 8192
+	help
+	  Stack size for the UART sensor processing thread.
+	  Increase if experiencing stack overflow issues.
+
+config APP_UART_SENSOR_THREAD_PRIORITY
+	int "UART sensor processing thread priority"
+	default 5
+	range 1 15
+	help
+	  Priority for the UART sensor processing thread.
+	  Lower values mean higher priority. Should be lower than critical system tasks.
+
+config APP_UART_SENSOR_ISR_PRIORITY
+	int "UART interrupt priority"
+	default 3
+	range 0 7
+	help
+	  Priority for UART interrupt handling.
+	  Lower values mean higher priority.
+
+config APP_UART_SENSOR_PROCESSING_TIMEOUT_MS
+	int "Data processing timeout (ms)"
+	default 5000
+	range 1000 30000
+	help
+	  Maximum time to wait for sensor data processing to complete.
+
+endmenu # Threading and Performance
+
+menu "Data Validation and Quality"
+
+config APP_UART_SENSOR_DATA_VALIDATION
+	bool "Enable sensor data validation"
+	default y
+	help
+	  Enable validation of sensor readings against expected ranges.
+	  Invalid data will be logged but not published.
+
+config APP_UART_SENSOR_TEMP_MIN
+	int "Minimum valid temperature (degrees Celsius)"
+	default -40
+	range -50 50
+	depends on APP_UART_SENSOR_DATA_VALIDATION
+	help
+	  Minimum valid temperature reading in degrees Celsius.
+	  Readings below this value will be considered invalid.
+
+config APP_UART_SENSOR_TEMP_MAX
+	int "Maximum valid temperature (degrees Celsius)"
+	default 85
+	range 30 150
+	depends on APP_UART_SENSOR_DATA_VALIDATION
+	help
+	  Maximum valid temperature reading in degrees Celsius.
+	  Readings above this value will be considered invalid.
+
+config APP_UART_SENSOR_HUMIDITY_MIN
+	int "Minimum valid humidity (percentage)"
+	default 0
+	range 0 10
+	depends on APP_UART_SENSOR_DATA_VALIDATION
+	help
+	  Minimum valid humidity reading in percentage.
+	  Readings below this value will be considered invalid.
+
+config APP_UART_SENSOR_HUMIDITY_MAX
+	int "Maximum valid humidity (percentage)"
+	default 100
+	range 90 110
+	depends on APP_UART_SENSOR_DATA_VALIDATION
+	help
+	  Maximum valid humidity reading in percentage.
+	  Readings above this value will be considered invalid.
+
+config APP_UART_SENSOR_BATTERY_MIN_MV
+	int "Minimum battery voltage (mV)"
+	default 2800
+	range 2000 3500
+	help
+	  Minimum battery voltage in millivolts (corresponds to 0%).
+	  Used for battery percentage calculation.
+
+config APP_UART_SENSOR_BATTERY_MAX_MV
+	int "Maximum battery voltage (mV)"
+	default 4200
+	range 3500 5000
+	help
+	  Maximum battery voltage in millivolts (corresponds to 100%).
+	  Used for battery percentage calculation.
+
+config APP_UART_SENSOR_DATA_MAX_AGE_MS
+	int "Maximum age of sensor data before it's considered stale (ms)"
+	default 300000
+	range 10000 3600000
+	help
+	  Sensor data older than this value will be considered stale and
+	  not published on button press or periodic requests.
+
+config APP_UART_SENSOR_REJECT_INVALID_DATA
+	bool "Reject invalid sensor data"
+	default n
+	depends on APP_UART_SENSOR_DATA_VALIDATION
+	help
+	  If enabled, invalid sensor data will be rejected and not stored.
+	  If disabled, invalid data will be stored but marked as invalid.
+
+endmenu # Data Validation and Quality
+
+menu "Probe ID and Naming"
+
+config APP_UART_SENSOR_PROBE_ID_FORMAT
+	bool "Enable probe ID formatting"
+	default n
+	help
+	  Enable formatting of probe IDs from plain names to MAC-style addresses.
+	  When disabled, probe names are used as-is.
+
+config APP_UART_SENSOR_PROBE_ID_PREFIX
+	string "Probe ID prefix to remove"
+	default "nRF_52840_"
+	depends on APP_UART_SENSOR_PROBE_ID_FORMAT
+	help
+	  Prefix to remove from probe names when processing probe IDs.
+	  Only used when probe ID formatting is enabled.
+
+config APP_UART_SENSOR_PROBE_ID_MIN_LEN
+	int "Minimum valid probe ID length"
+	default 3
+	range 1 64
+	help
+	  Minimum length for a valid probe ID string.
+	  Shorter IDs will be rejected as invalid.
+
+config APP_UART_SENSOR_PROBE_ID_MAX_LEN
+	int "Maximum probe ID length"
+	default 31
+	range 16 64
+	help
+	  Maximum length for probe ID strings.
+	  Longer IDs will be truncated.
+
+config APP_UART_SENSOR_DEFAULT_PROBE_ID
+	string "Default probe ID"
+	default "UNKNOWN_PROBE"
+	help
+	  Default probe ID to use when no valid ID is received.
+
+endmenu # Probe ID and Naming
+
+menu "Communication Protocol"
+
+config APP_UART_SENSOR_PROTOCOL_VERSION
+	int "Sensor protocol version"
+	default 1
+	range 1 255
+	help
+	  Version of the sensor communication protocol.
+	  Used for compatibility checking and future protocol extensions.
+
+config APP_UART_SENSOR_MESSAGE_DELIMITER
+	string "Message delimiter characters"
+	default "\r\n"
+	help
+	  Characters that delimit complete sensor messages.
+	  Common values: \n, \r\n, \r, ;
+
+config APP_UART_SENSOR_FIELD_SEPARATOR
+	string "Field separator character"
+	default ":"
+	help
+	  Character that separates the probe name from sensor data.
+
+config APP_UART_SENSOR_VALUE_SEPARATOR
+	string "Value separator character"
+	default ","
+	help
+	  Character that separates individual sensor values.
+
+config APP_UART_SENSOR_RETRY_COUNT
+	int "Message parsing retry count"
+	default 3
+	range 1 10
+	help
+	  Number of times to retry parsing a malformed message before discarding it.
+
+config APP_UART_SENSOR_IGNORE_CHECKSUM
+	bool "Ignore message checksums"
+	default y
+	help
+	  If disabled, messages must include valid checksums for processing.
+	  Currently not implemented - reserved for future use.
+
+endmenu # Communication Protocol
+
+menu "ZBUS and Messaging"
+
+config APP_UART_SENSOR_ZBUS_TIMEOUT_MS
+	int "ZBUS channel publication timeout (ms)"
+	default 1000
+	range 100 5000
+	help
+	  Timeout for publishing sensor data to ZBUS channels.
+	  Longer timeouts reduce data loss but may cause delays.
+
+config APP_UART_SENSOR_TIMESTAMP
+	bool "Include timestamp in sensor messages"
+	default y
+	help
+	  Include timestamp information in UART sensor messages.
+	  Timestamps use system uptime in milliseconds.
+
+config APP_UART_SENSOR_AUTO_PUBLISH
+	bool "Automatically publish received data"
+	default y
+	help
+	  Automatically publish sensor data to ZBUS when received via UART.
+	  If disabled, data must be manually requested via API calls.
+
+config APP_UART_SENSOR_PUBLISH_ON_CHANGE
+	bool "Only publish data when values change"
+	default n
+	help
+	  Only publish sensor data when values have changed significantly.
+	  Reduces network traffic but may miss small variations.
+
+config APP_UART_SENSOR_CHANGE_THRESHOLD_TEMP
+	int "Temperature change threshold (0.1°C)"
+	default 5
+	range 1 100
+	depends on APP_UART_SENSOR_PUBLISH_ON_CHANGE
+	help
+	  Minimum temperature change required to trigger publication (in 0.1°C units).
+	  Example: 5 = 0.5°C change threshold.
+
+config APP_UART_SENSOR_CHANGE_THRESHOLD_HUMIDITY
+	int "Humidity change threshold (0.1%)"
+	default 10
+	range 1 100
+	depends on APP_UART_SENSOR_PUBLISH_ON_CHANGE
+	help
+	  Minimum humidity change required to trigger publication (in 0.1% units).
+	  Example: 10 = 1.0% change threshold.
+
+endmenu # ZBUS and Messaging
+
+menu "Error Handling and Recovery"
+
+config APP_UART_SENSOR_ERROR_RECOVERY
+	bool "Enable automatic error recovery"
+	default y
+	help
+	  Enable automatic recovery from UART communication errors.
+	  Includes device reset and re-initialization on persistent errors.
+
+config APP_UART_SENSOR_MAX_CONSECUTIVE_ERRORS
+	int "Maximum consecutive errors before recovery"
+	default 5
+	range 3 20
+	depends on APP_UART_SENSOR_ERROR_RECOVERY
+	help
+	  Number of consecutive errors that trigger automatic recovery.
+
+config APP_UART_SENSOR_RECOVERY_DELAY_MS
+	int "Delay between recovery attempts (ms)"
+	default 5000
+	range 1000 30000
+	depends on APP_UART_SENSOR_ERROR_RECOVERY
+	help
+	  Delay between automatic recovery attempts.
+
+config APP_UART_SENSOR_STATISTICS
+	bool "Enable error and performance statistics"
+	default y
+	help
+	  Collect statistics on UART communication errors and performance.
+	  Useful for debugging and system monitoring.
+
+endmenu # Error Handling and Recovery
 
 endif # APP_UART_SENSOR

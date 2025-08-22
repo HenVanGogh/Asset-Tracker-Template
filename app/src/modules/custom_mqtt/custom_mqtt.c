@@ -903,58 +903,79 @@ static void process_uart_sensor_data(const struct uart_sensor_msg *msg)
 {
 	cJSON *json = NULL;
 	cJSON *sensor_data = NULL;
+	cJSON *data_quality = NULL;
 	
 	if (!msg) {
 		LOG_ERR("Invalid UART sensor message");
 		return;
 	}
 	
-	/* Validate sensor data ranges */
-	if (!SENSOR_VALUE_IN_RANGE(msg->temperature, UART_SENSOR_TEMP_MIN, UART_SENSOR_TEMP_MAX)) {
-		LOG_WRN("Temperature %.2f out of range [%.2f, %.2f]", 
-			msg->temperature, UART_SENSOR_TEMP_MIN, UART_SENSOR_TEMP_MAX);
+	/* Handle different message types */
+	if (msg->type == UART_SENSOR_ERROR_RESPONSE) {
+		LOG_WRN("UART sensor error received: %d - %s", msg->error_type, msg->error_details);
+		/* Could publish error information to MQTT if needed */
+		return;
 	}
 	
-	if (!SENSOR_VALUE_IN_RANGE(msg->humidity, UART_SENSOR_HUMIDITY_MIN, UART_SENSOR_HUMIDITY_MAX)) {
-		LOG_WRN("Humidity %.2f out of range [%.2f, %.2f]", 
-			msg->humidity, UART_SENSOR_HUMIDITY_MIN, UART_SENSOR_HUMIDITY_MAX);
-	}
-	
-	if (!SENSOR_VALUE_IN_RANGE(msg->probe_battery, UART_SENSOR_BATTERY_MIN, UART_SENSOR_BATTERY_MAX)) {
-		LOG_WRN("Probe battery %.2f out of range [%.2f, %.2f]", 
-			msg->probe_battery, UART_SENSOR_BATTERY_MIN, UART_SENSOR_BATTERY_MAX);
+	if (msg->type != UART_SENSOR_DATA_RESPONSE) {
+		LOG_DBG("Ignoring non-data UART sensor message type: %d", msg->type);
+		return;
 	}
 	
 	/* Create JSON payload */
 	json = cJSON_CreateObject();
 	sensor_data = cJSON_CreateObject();
+	data_quality = cJSON_CreateObject();
 	
-	if (!json || !sensor_data) {
+	if (!json || !sensor_data || !data_quality) {
 		LOG_ERR("Failed to create JSON objects");
 		goto cleanup;
 	}
 	
-	cJSON_AddItemToObject(json, "sensor_data", sensor_data);
+	/* Add metadata */
+	cJSON_AddStringToObject(json, "device_id", MQTT_CLIENT_ID);
 	cJSON_AddStringToObject(json, "type", "uart_sensor");
 	cJSON_AddNumberToObject(json, "sequence", mqtt_ctx.publish_sequence + 1);
+	cJSON_AddNumberToObject(json, "timestamp", k_uptime_get());
 	
-	/* Add UART sensor data with proper precision */
+	/* Add UART sensor data with proper precision - use probe name as-is */
 	cJSON_AddNumberToObject(sensor_data, "temperature", round(msg->temperature * 100) / 100.0);
 	cJSON_AddNumberToObject(sensor_data, "humidity", round(msg->humidity * 100) / 100.0);
-	cJSON_AddStringToObject(sensor_data, "probe_id", msg->probe_id);
+	cJSON_AddStringToObject(sensor_data, "probe_name", msg->probe_id); /* Changed from probe_id to probe_name for clarity */
 	cJSON_AddNumberToObject(sensor_data, "probe_battery", round(msg->probe_battery * 10) / 10.0);
+	
+	/* Add data quality indicators */
+	cJSON_AddBoolToObject(data_quality, "temperature_valid", msg->data_quality.temperature_valid);
+	cJSON_AddBoolToObject(data_quality, "humidity_valid", msg->data_quality.humidity_valid);
+	cJSON_AddBoolToObject(data_quality, "battery_valid", msg->data_quality.battery_valid);
+	cJSON_AddBoolToObject(data_quality, "probe_name_valid", msg->data_quality.probe_id_valid);
 	
 #if defined(CONFIG_APP_UART_SENSOR_TIMESTAMP)
 	if (msg->timestamp > 0) {
-		cJSON_AddNumberToObject(sensor_data, "timestamp", msg->timestamp);
+		cJSON_AddNumberToObject(sensor_data, "sensor_timestamp", msg->timestamp);
 	}
 #endif
+	
+	/* Add error information if present */
+	if (msg->error_type != UART_SENSOR_ERROR_NONE) {
+		cJSON_AddNumberToObject(sensor_data, "error_type", msg->error_type);
+		if (strlen(msg->error_details) > 0) {
+			cJSON_AddStringToObject(sensor_data, "error_details", msg->error_details);
+		}
+	}
+	
+	/* Attach sub-objects to main JSON */
+	cJSON_AddItemToObject(json, "data", sensor_data);
+	cJSON_AddItemToObject(json, "quality", data_quality);
 	
 	/* Convert to string and publish */
 	int ret = safe_publish_json(json, "uart_sensor");
 	if (ret == 0) {
-		LOG_INF("UART sensor data published: %s, T=%.1f°C, H=%.1f%%, Bat=%.1f%%", 
-			msg->probe_id, msg->temperature, msg->humidity, msg->probe_battery);
+		LOG_INF("UART sensor data published: %s, T=%.1f°C, H=%.1f%%, Bat=%.1f%% (Quality: T:%s, H:%s, B:%s)", 
+			msg->probe_id, (double)msg->temperature, (double)msg->humidity, (double)msg->probe_battery,
+			msg->data_quality.temperature_valid ? "OK" : "ERR",
+			msg->data_quality.humidity_valid ? "OK" : "ERR",
+			msg->data_quality.battery_valid ? "OK" : "ERR");
 	}
 
 cleanup:
@@ -1132,7 +1153,7 @@ static void custom_mqtt_thread(void)
 					process_uart_sensor_data(&msg);
 					k_mutex_unlock(&mqtt_ctx.data_mutex);
 					LOG_DBG("ZBUS UART sensor data processed: %s, T=%.1f°C", 
-						msg.probe_id, msg.temperature);
+						msg.probe_id, (double)msg.temperature);
 				} else {
 					if (ret != -EBUSY) {
 						LOG_WRN("Failed to read UART_SENSOR_CHAN: %d", ret);
