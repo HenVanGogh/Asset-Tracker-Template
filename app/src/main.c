@@ -577,7 +577,7 @@ static void sample_data_entry(void *o)
 {
 	int err;
 #if defined(CONFIG_APP_LOCATION)
-	enum location_msg_type location_msg = LOCATION_SEARCH_TRIGGER;
+	/* enum location_msg_type location_msg = LOCATION_SEARCH_TRIGGER; */
 #endif
 	struct main_state *state_object = (struct main_state *)o;
 

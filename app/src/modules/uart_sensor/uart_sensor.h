@@ -44,7 +44,6 @@ extern "C" {
 /* Probe ID configuration */
 #define UART_PROBE_ID_MIN_LEN        CONFIG_APP_UART_SENSOR_PROBE_ID_MIN_LEN
 #define UART_PROBE_ID_MAX_LEN        CONFIG_APP_UART_SENSOR_PROBE_ID_MAX_LEN
-#define UART_DEFAULT_PROBE_ID        CONFIG_APP_UART_SENSOR_DEFAULT_PROBE_ID
 
 /* Error handling */
 #ifdef CONFIG_APP_UART_SENSOR_ERROR_RECOVERY
@@ -67,11 +66,14 @@ enum uart_sensor_msg_type {
 	/** Statistics message containing performance and error counters. */
 	UART_SENSOR_STATS_RESPONSE = 0x3,
 
+	/** Generic response message containing text data from UART. */
+	UART_SENSOR_GENERIC_RESPONSE = 0x4,
+
 	/* Input message types */
 
 	/** Request to sample sensor data from external probe via UART. */
 	UART_SENSOR_DATA_REQUEST = 0x10,
-
+	
 	/** Request to reset error counters and statistics. */
 	UART_SENSOR_RESET_STATS_REQUEST = 0x11,
 
@@ -87,6 +89,7 @@ enum uart_sensor_error_type {
 	UART_SENSOR_ERROR_DEVICE_NOT_READY,
 	UART_SENSOR_ERROR_BUFFER_OVERFLOW,
 	UART_SENSOR_ERROR_VALIDATION_FAILED,
+	UART_SENSOR_ERROR_REMOTE_ERROR, /* Error reported by the remote device (ERR:...) */
 };
 
 struct uart_sensor_msg {
@@ -112,6 +115,9 @@ struct uart_sensor_msg {
 
 	/** Additional error details or status information. */
 	char error_details[64];
+	
+	/** Generic response text (if type is UART_SENSOR_GENERIC_RESPONSE). */
+	char response_text[128];
 
 	/** Data quality indicators. */
 	struct {
@@ -169,6 +175,15 @@ int uart_sensor_init(void);
  * @return 0 on success, negative error code on failure
  */
 int uart_sensor_sample_request(void);
+
+/** @brief Send a raw command string to the UART sensor.
+ *
+ * Appends a newline if one is not present.
+ *
+ * @param cmd Null-terminated command string to send
+ * @return 0 on success, negative error code on failure
+ */
+int uart_sensor_send_command(const char *cmd);
 
 /** @brief Get current UART sensor data
  *

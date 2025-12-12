@@ -6,6 +6,7 @@
 
 if(CONFIG_APP_CUSTOM_MQTT)
 	target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/custom_mqtt.c)
+	target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.)
 	
 	if(CONFIG_APP_CUSTOM_MQTT_SHELL)
 		target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/custom_mqtt_shell.c)

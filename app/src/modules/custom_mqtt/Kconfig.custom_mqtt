@@ -18,9 +18,16 @@ config APP_CUSTOM_MQTT_SHELL
 	help
 	  Enable custom MQTT shell commands.
 
+config APP_CUSTOM_MQTT_USE_TLS
+	bool "Use TLS for MQTT connection"
+	default y
+	help
+	  Enable TLS for the MQTT connection.
+
 config APP_CUSTOM_MQTT_SEC_TAG
 	int "Security tag for custom MQTT connection"
 	default 12345
+	depends on APP_CUSTOM_MQTT_USE_TLS
 	help
 	  The security tag that corresponds to the credentials (CA, client cert,
 	  private key) provisioned in the modem for the custom MQTT broker.

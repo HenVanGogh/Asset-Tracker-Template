@@ -4,16 +4,18 @@
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
-#include <thingy91x_wifi.dtsi>
+/* #include <thingy91x_wifi.dtsi> */
 
 &bme680 {
 	status = "okay";
 };
 
 / {
+/*
 	chosen {
 		zephyr,wifi = &nordic_wlan0;
 	};
+*/
 };
 
 &uart1 {
@@ -55,6 +57,8 @@
 
 
 /* Switch to nrf7000 emulation so that scan-only mode is used. */
+/*
 &nrf70 {
 	compatible = "nordic,nrf7000-spi";
 };
+*/

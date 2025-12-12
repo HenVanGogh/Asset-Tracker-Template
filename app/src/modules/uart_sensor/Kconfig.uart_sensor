@@ -41,7 +41,7 @@ config APP_UART_SENSOR_LINE_BUFFER_SIZE
 config APP_UART_SENSOR_MSG_QUEUE_SIZE
 	int "UART message queue size"
 	default 10
-	range 5 50
+	range 5 128
 	help
 	  Number of UART messages that can be queued for processing.
 	  Larger queues prevent data loss during high-frequency transmissions.
@@ -274,7 +274,7 @@ menu "ZBUS and Messaging"
 config APP_UART_SENSOR_ZBUS_TIMEOUT_MS
 	int "ZBUS channel publication timeout (ms)"
 	default 1000
-	range 100 5000
+	range 0 5000
 	help
 	  Timeout for publishing sensor data to ZBUS channels.
 	  Longer timeouts reduce data loss but may cause delays.

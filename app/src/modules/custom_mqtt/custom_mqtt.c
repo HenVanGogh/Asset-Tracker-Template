@@ -101,7 +101,9 @@ static struct smf_ctx sm_ctx;
 static uint8_t mqtt_client_id[] = MQTT_CLIENT_ID;
 
 /* Security tag for TLS */
+#if defined(CONFIG_APP_CUSTOM_MQTT_USE_TLS)
 static sec_tag_t sec_tag_list[] = { CONFIG_APP_CUSTOM_MQTT_SEC_TAG };
+#endif
 
 /* Register zbus subscriber */
 ZBUS_MSG_SUBSCRIBER_DEFINE(custom_mqtt_subscriber);
@@ -217,24 +219,61 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 		break;
 
 	case MQTT_EVT_PUBLISH:
+		LOG_INF(">>> MQTT_EVT_PUBLISH received! <<<");
 		LOG_INF("MQTT message received on topic: %.*s",
 			evt->param.publish.message.topic.topic.size,
 			evt->param.publish.message.topic.topic.utf8);
+		LOG_INF("Message ID: %u, QoS: %d, Payload len: %u",
+			evt->param.publish.message_id,
+			evt->param.publish.message.topic.qos,
+			evt->param.publish.message.payload.len);
 		
-		/* Validate payload size */
-		if (evt->param.publish.message.payload.len >= MQTT_PAYLOAD_BUF_SIZE) {
-			LOG_WRN("Received message too large: %u bytes, truncating",
+		/* Handle payload based on QoS level */
+		size_t len = 0;
+		int ret = 0;
+		
+		/* For all QoS levels, try to read from socket if payload length > 0 */
+		if (evt->param.publish.message.payload.len > 0) {
+			LOG_INF("Reading payload (%u bytes) from socket...", 
 				evt->param.publish.message.payload.len);
+			
+			/* Try blocking read first */
+			ret = mqtt_read_publish_payload_blocking(client, mqtt_ctx.payload_buf, 
+								 MQTT_PAYLOAD_BUF_SIZE - 1);
+			LOG_INF("mqtt_read_publish_payload_blocking returned: %d", ret);
+			
+			if (ret >= 0) {
+				len = ret;
+				mqtt_ctx.payload_buf[len] = '\0';
+				LOG_INF("Successfully read %zu bytes from socket", len);
+			} else if (evt->param.publish.message.payload.data) {
+				/* Fallback: try to read from event structure (QoS 0 sometimes provides this) */
+				LOG_WRN("Socket read failed (%d), trying event structure", ret);
+				len = MIN(evt->param.publish.message.payload.len, MQTT_PAYLOAD_BUF_SIZE - 1);
+				memcpy(mqtt_ctx.payload_buf, evt->param.publish.message.payload.data, len);
+				mqtt_ctx.payload_buf[len] = '\0';
+				LOG_INF("Read %zu bytes from event structure", len);
+			} else {
+				LOG_ERR("Failed to read payload - socket error %d and no event data", ret);
+			}
 		}
 		
-		/* Copy received data to message with bounds checking */
-		size_t len = MIN(evt->param.publish.message.payload.len, 
-				 MQTT_PAYLOAD_BUF_SIZE - 1);
+		/* Send acknowledgment for QoS 1/2 messages AFTER reading payload */
+		if (evt->param.publish.message.topic.qos == MQTT_QOS_1_AT_LEAST_ONCE) {
+			struct mqtt_puback_param param = {
+				.message_id = evt->param.publish.message_id
+			};
+			ret = mqtt_publish_qos1_ack(client, &param);
+			if (ret) {
+				LOG_ERR("Failed to send PUBACK: %d", ret);
+			} else {
+				LOG_INF("Sent PUBACK for message_id %u", param.message_id);
+			}
+		} else if (evt->param.publish.message.topic.qos == MQTT_QOS_2_EXACTLY_ONCE) {
+			LOG_WRN("QoS 2 not fully implemented");
+		}
 		
-		if (evt->param.publish.message.payload.data != NULL && len > 0) {
-			memcpy(mqtt_ctx.payload_buf, evt->param.publish.message.payload.data, len);
-			mqtt_ctx.payload_buf[len] = '\0';
-			
+		if (len > 0) {
 			LOG_INF("Received message (%zu bytes): %s", len, (char *)mqtt_ctx.payload_buf);
 			
 			/* Process command and send response */
@@ -248,8 +287,25 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 				/* Parse command if it's JSON */
 				cJSON *received_json = cJSON_Parse((char *)mqtt_ctx.payload_buf);
 				if (received_json) {
+					/* Check for "type": "uart_passthrough" format first */
+					cJSON *type = cJSON_GetObjectItem(received_json, "type");
 					cJSON *command = cJSON_GetObjectItem(received_json, "command");
-					if (command && cJSON_IsString(command)) {
+					
+					if (type && cJSON_IsString(type) && 
+					    strcmp(type->valuestring, "uart_passthrough") == 0 &&
+					    command && cJSON_IsString(command)) {
+						/* Handle uart_passthrough: forward command directly to UART */
+						LOG_INF("UART passthrough command: %s", command->valuestring);
+						
+						/* Publish forward request to ZBUS */
+						msg.type = CUSTOM_MQTT_EVT_FORWARD_UART;
+						msg.forward_uart.data = command->valuestring;
+						msg.forward_uart.len = strlen(command->valuestring);
+						zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
+						
+						cJSON_AddStringToObject(response, "status", "uart_passthrough_sent");
+						cJSON_AddStringToObject(response, "uart_command", command->valuestring);
+					} else if (command && cJSON_IsString(command)) {
 						LOG_INF("Processing command: %s", command->valuestring);
 						
 						if (strcmp(command->valuestring, "get_location") == 0) {
@@ -263,12 +319,42 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 #endif
 						} else if (strcmp(command->valuestring, "get_status") == 0) {
 							LOG_INF("Status request received via MQTT");
+							
+							/* Forward "status" command to UART to get sensor status */
+							msg.type = CUSTOM_MQTT_EVT_FORWARD_UART;
+							msg.forward_uart.data = "status";
+							msg.forward_uart.len = 6;
+							zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
+							
 							cJSON_AddStringToObject(response, "status", "online");
 							cJSON_AddNumberToObject(response, "uptime_ms", k_uptime_get());
 							cJSON_AddNumberToObject(response, "mqtt_state", mqtt_ctx.state);
 							cJSON_AddBoolToObject(response, "network_connected", mqtt_ctx.network_connected);
+						} else if (strcmp(command->valuestring, "uart_command") == 0) {
+							cJSON *args = cJSON_GetObjectItem(received_json, "args");
+							if (args && cJSON_IsString(args)) {
+								LOG_INF("Forwarding UART command: %s", args->valuestring);
+								
+								/* Publish forward request to ZBUS */
+								msg.type = CUSTOM_MQTT_EVT_FORWARD_UART;
+								msg.forward_uart.data = args->valuestring;
+								msg.forward_uart.len = strlen(args->valuestring);
+								zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
+								
+								cJSON_AddStringToObject(response, "status", "command_forwarded");
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_args");
+							}
 						} else {
-							cJSON_AddStringToObject(response, "status", "unknown_command");
+							/* Unknown command - forward it to UART anyway as a passthrough */
+							LOG_INF("Unknown command, forwarding to UART: %s", command->valuestring);
+							
+							msg.type = CUSTOM_MQTT_EVT_FORWARD_UART;
+							msg.forward_uart.data = command->valuestring;
+							msg.forward_uart.len = strlen(command->valuestring);
+							zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
+							
+							cJSON_AddStringToObject(response, "status", "forwarded_to_uart");
 						}
 						
 						cJSON_AddStringToObject(response, "command_processed", command->valuestring);
@@ -291,7 +377,7 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 			msg.data_received.len = len;
 			zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
 		} else {
-			LOG_WRN("Received message with invalid payload");
+			LOG_WRN("Received message with no payload or read failed");
 		}
 		break;
 
@@ -304,7 +390,9 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 		break;
 
 	case MQTT_EVT_SUBACK:
+		LOG_INF(">>> MQTT_EVT_SUBACK received! <<<");
 		LOG_INF("MQTT subscription acknowledged (message_id: %u)", evt->param.suback.message_id);
+		LOG_INF("Successfully subscribed to topic: %s", MQTT_SUB_TOPIC);
 		break;
 
 	case MQTT_EVT_UNSUBACK:
@@ -445,8 +533,9 @@ static int custom_mqtt_connect(void)
 		LOG_INF("Using anonymous connection (no credentials)");
 	}
 
-	LOG_INF("Configuring TLS settings");
-	/* Configure TLS */
+	LOG_INF("Configuring transport settings");
+	/* Configure Transport */
+#if defined(CONFIG_APP_CUSTOM_MQTT_USE_TLS)
 	mqtt_ctx.client.transport.type = MQTT_TRANSPORT_SECURE;
 	
 	struct mqtt_sec_config *tls_config = &mqtt_ctx.client.transport.tls.config;
@@ -465,6 +554,10 @@ static int custom_mqtt_connect(void)
 	}
 	
 	tls_config->hostname = MQTT_BROKER_HOSTNAME;
+#else
+	mqtt_ctx.client.transport.type = MQTT_TRANSPORT_NON_SECURE;
+	LOG_INF("Using non-secure transport (TCP)");
+#endif
 
 	LOG_INF("Starting MQTT connection to %s:%d", MQTT_BROKER_HOSTNAME, MQTT_BROKER_PORT);
 	LOG_INF("Client ID: %s, Username: %s", MQTT_CLIENT_ID, MQTT_USERNAME);
@@ -708,9 +801,17 @@ static void connecting_run(void *obj)
 {
 	/* Poll MQTT client for events - this is crucial for processing CONNACK */
 	int ret = mqtt_input(&mqtt_ctx.client);
-	if (ret < 0) {
+	if (ret < 0 && ret != -EAGAIN) {
 		LOG_ERR("MQTT input error during connection: %d", ret);
 		smf_set_state(&sm_ctx, &mqtt_states[MQTT_STATE_ERROR]);
+		return;
+	}
+	
+	/* Check if we transitioned to connected state via CONNACK event */
+	if (mqtt_ctx.state == MQTT_STATE_CONNECTED) {
+		LOG_INF("CONNACK received, transitioning to connected state");
+		smf_set_state(&sm_ctx, &mqtt_states[MQTT_STATE_CONNECTED]);
+		return;
 	}
 	
 	/* Also call mqtt_live to maintain the connection */
@@ -730,6 +831,8 @@ static void connected_entry(void *obj)
 	struct mqtt_subscription_list subscription_list;
 	struct mqtt_topic subscribe_topic;
 	
+	LOG_INF(">>> Attempting to subscribe to topic: %s <<<", MQTT_SUB_TOPIC);
+	
 	subscribe_topic.topic.utf8 = MQTT_SUB_TOPIC;
 	subscribe_topic.topic.size = strlen(MQTT_SUB_TOPIC);
 	subscribe_topic.qos = MQTT_QOS_1_AT_LEAST_ONCE;
@@ -740,9 +843,9 @@ static void connected_entry(void *obj)
 	
 	int ret = mqtt_subscribe(&mqtt_ctx.client, &subscription_list);
 	if (ret) {
-		LOG_ERR("Failed to subscribe to topic: %d", ret);
+		LOG_ERR("Failed to send SUBSCRIBE request: %d", ret);
 	} else {
-		LOG_INF("Subscribed to topic: %s", MQTT_SUB_TOPIC);
+		LOG_INF("SUBSCRIBE request sent for topic: %s (waiting for SUBACK)", MQTT_SUB_TOPIC);
 	}
 	
 	/* Send initial connection message */
@@ -1123,7 +1226,32 @@ static void process_uart_sensor_data(const struct uart_sensor_msg *msg)
 	/* Handle different message types */
 	if (msg->type == UART_SENSOR_ERROR_RESPONSE) {
 		LOG_WRN("UART sensor error received: %d - %s", msg->error_type, msg->error_details);
-		/* Could publish error information to MQTT if needed */
+		
+		/* Publish error to MQTT */
+		cJSON *json = cJSON_CreateObject();
+		if (json) {
+			cJSON_AddStringToObject(json, "type", "uart_error");
+			cJSON_AddNumberToObject(json, "error_code", msg->error_type);
+			cJSON_AddStringToObject(json, "details", msg->error_details);
+			cJSON_AddNumberToObject(json, "timestamp", k_uptime_get());
+			safe_publish_json(json, "uart_error");
+			cJSON_Delete(json);
+		}
+		return;
+	}
+	
+	if (msg->type == UART_SENSOR_GENERIC_RESPONSE) {
+		LOG_INF("UART generic response received: %s", msg->response_text);
+		
+		/* Publish generic response to MQTT */
+		cJSON *json = cJSON_CreateObject();
+		if (json) {
+			cJSON_AddStringToObject(json, "type", "uart_response");
+			cJSON_AddStringToObject(json, "data", msg->response_text);
+			cJSON_AddNumberToObject(json, "timestamp", k_uptime_get());
+			safe_publish_json(json, "uart_response");
+			cJSON_Delete(json);
+		}
 		return;
 	}
 	
@@ -1133,6 +1261,27 @@ static void process_uart_sensor_data(const struct uart_sensor_msg *msg)
 	}
 	
 	/* Create JSON payload */
+	/* Check if we have valid sensor data */
+	if (strlen(msg->probe_id) == 0) {
+		LOG_DBG("No sensor connected (empty probe ID)");
+		
+		json = cJSON_CreateObject();
+		if (json) {
+			cJSON_AddStringToObject(json, "type", "uart_sensor");
+			cJSON_AddStringToObject(json, "status", "no_sensors_present");
+			cJSON_AddNumberToObject(json, "timestamp", k_uptime_get());
+			
+			/* Use safe publish function */
+			int ret = safe_publish_json(json, "uart_sensor_status");
+			if (ret == 0) {
+				LOG_INF("Published 'no sensors present' status");
+			}
+			cJSON_Delete(json);
+			json = NULL; /* Reset for safety */
+		}
+		return;
+	}
+
 	json = cJSON_CreateObject();
 	sensor_data = cJSON_CreateObject();
 	data_quality = cJSON_CreateObject();
@@ -1274,7 +1423,7 @@ static void process_network_msg(const struct network_msg *msg)
 	}
 }
 
-/* Main thread function */
+	/* Main thread function */
 static void custom_mqtt_thread(void)
 {
 	const struct zbus_channel *chan;

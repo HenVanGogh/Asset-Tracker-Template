@@ -28,6 +28,8 @@ enum custom_mqtt_msg_type {
 	CUSTOM_MQTT_EVT_ERROR,
 	/** Data received from server. */
 	CUSTOM_MQTT_EVT_DATA_RECEIVED,
+	/** Forward command to UART sensor. */
+	CUSTOM_MQTT_EVT_FORWARD_UART,
 };
 
 /**
@@ -49,6 +51,12 @@ struct custom_mqtt_msg {
 			size_t len;
 		} data_received;
 		
+		/** For FORWARD_UART: Data to forward to UART */
+		struct {
+			char *data;
+			size_t len;
+		} forward_uart;
+
 		/** For ERROR events */
 		struct {
 			int err_code;

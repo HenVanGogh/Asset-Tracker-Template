@@ -17,6 +17,7 @@
 #include <stdio.h>
 
 #include "uart_sensor.h"
+#include "custom_mqtt.h" /* For CUSTOM_MQTT_CHAN and message types */
 
 LOG_MODULE_REGISTER(uart_sensor, CONFIG_APP_UART_SENSOR_LOG_LEVEL);
 
@@ -90,38 +91,50 @@ static void uart_isr_callback(const struct device *dev, void *user_data)
 		}
 		
 		if (recv_len == 0) {
-			LOG_DBG("No data in UART FIFO");
 			return;
 		}
 		
-		LOG_DBG("UART received %d bytes", recv_len);
 		
 		/* Process received bytes and assemble complete lines */
 		for (int i = 0; i < recv_len; i++) {
 			uint8_t c = buffer[i];
+			LOG_INF("ISR RX: %02x ('%c')", c, (c >= ' ' && c <= '~') ? c : '.');
 			
 			/* Check for line termination characters */
 			bool is_line_end = false;
 			const char *delim = UART_MESSAGE_DELIMITER;
+			
+			/* Check configured delimiters */
 			for (int j = 0; delim[j] != '\0'; j++) {
 				if (c == delim[j]) {
 					is_line_end = true;
 					break;
 				}
 			}
+			/* Also check standard carriage return and newline as nRF5340 might use it */
+			if (c == '\r' || c == '\n') {
+				is_line_end = true;
+			}
 			
-			if (is_line_end && line_buf_pos > 0) {
-				/* Complete line received - null terminate and queue for processing */
-				line_buf[line_buf_pos] = '\0';
-				
-				if (k_msgq_put(&uart_msgq, line_buf, K_NO_WAIT) != 0) {
-					LOG_WRN("UART message queue full, dropping message: %s", line_buf);
-					uart_error_handler(UART_SENSOR_ERROR_BUFFER_OVERFLOW, "Message queue full");
-				} else {
-					LOG_DBG("Queued UART message: %s", line_buf);
+			if (is_line_end) {
+				if (line_buf_pos > 0) {
+					/* Complete line received - null terminate and queue for processing */
+					line_buf[line_buf_pos] = '\0';
+					
+					LOG_INF(">>> UART LINE COMPLETE (%d chars): '%s' <<<", 
+							line_buf_pos, line_buf);
+					
+					if (k_msgq_put(&uart_msgq, line_buf, K_NO_WAIT) != 0) {
+						LOG_WRN("UART message queue full, dropping message: %s", line_buf);
+						uart_error_handler(UART_SENSOR_ERROR_BUFFER_OVERFLOW, "Message queue full");
+					} else {
+						LOG_INF(">>> UART RX queued (%d chars): %s", line_buf_pos, line_buf);
+						k_sem_give(&uart_wake_sem);
+					}
+					
+					line_buf_pos = 0;
 				}
-				
-				line_buf_pos = 0;
+				/* If line_buf_pos == 0, it's an empty line (e.g. \n after \r), just ignore */
 			} else if (c >= ' ' && c <= '~' && line_buf_pos < (sizeof(line_buf) - 1)) {
 				/* Printable character - add to line buffer */
 				line_buf[line_buf_pos++] = c;
@@ -129,6 +142,37 @@ static void uart_isr_callback(const struct device *dev, void *user_data)
 			/* Ignore control characters and handle buffer overflow */
 		}
 	}
+}
+
+/* Send a raw command string to the UART sensor */
+int uart_sensor_send_command(const char *cmd)
+{
+	if (!uart_module_state.initialized) {
+		LOG_ERR("UART sensor module not initialized");
+		return -ENODEV;
+	}
+
+	if (!cmd) {
+		return -EINVAL;
+	}
+
+	if (!device_is_ready(uart_dev)) {
+		LOG_ERR("UART device not ready");
+		return -ENODEV;
+	}
+
+	LOG_INF("Sending UART command: %s", cmd);
+
+	/* Transmit command string */
+	for (int i = 0; cmd[i] != '\0'; i++) {
+		uart_poll_out(uart_dev, cmd[i]);
+	}
+
+	/* Append CR LF for robust command termination */
+	uart_poll_out(uart_dev, '\r');
+	uart_poll_out(uart_dev, '\n');
+
+	return 0;
 }
 
 /* Helper function to convert battery voltage (mV) to percentage */
@@ -272,7 +316,7 @@ static struct uart_sensor_msg current_sensor_data = {
 	.type = UART_SENSOR_DATA_RESPONSE,
 	.temperature = 0.0f,
 	.humidity = 0.0f,
-	.probe_id = UART_DEFAULT_PROBE_ID,
+	.probe_id = "",
 	.probe_battery = 0.0f,
 	.timestamp = 0,
 	.error_type = UART_SENSOR_ERROR_NONE,
@@ -349,14 +393,13 @@ static void uart_processing_thread(void *p1, void *p2, void *p3)
 		if (k_sem_take(&uart_wake_sem, K_MSEC(UART_PROCESSING_TIMEOUT_MS)) == 0) {
 			LOG_DBG("Woke up from UART activity");
 		} else {
-			/* Timeout - update uptime and continue */
+			/* Timeout - update uptime and check queue anyway (fail-safe) */
 			uart_module_state.stats.uptime_ms = k_uptime_get();
-			continue;
 		}
 		
 		/* Process all pending UART messages */
 		while (k_msgq_get(&uart_msgq, &rx_buf, K_NO_WAIT) == 0) {
-			LOG_DBG("Processing UART data: %s", rx_buf);
+			LOG_INF("[RAW UART RX]: '%s'", rx_buf);
 			
 			/* Process the received line */
 			int ret = uart_sensor_process_data_line(rx_buf);
@@ -375,53 +418,24 @@ static void uart_processing_thread(void *p1, void *p2, void *p3)
 	}
 }
 
-/* UART device setup function */
+/* UART device setup function - simplified to match working nRF5340 pattern */
 static int uart_device_setup(void)
 {
-	int err;
-	
 	if (!device_is_ready(uart_dev)) {
 		LOG_ERR("UART device not ready");
 		return -ENODEV;
 	}
 	
-	LOG_DBG("UART device found and ready");
-	
-#ifdef CONFIG_APP_UART_SENSOR_POWER_MANAGEMENT
-	/* Ensure device is powered on */
-	err = pm_device_action_run(uart_dev, PM_DEVICE_ACTION_RESUME);
-	if (err && err != -EALREADY) {
-		LOG_WRN("Failed to resume UART device: %d (continuing)", err);
-	}
-	
-	/* Configure UART for wake-up capability */
-	err = pm_device_wakeup_enable(uart_dev, true);
-	if (err) {
-		LOG_WRN("Failed to enable UART wake-up, error: %d (continuing anyway)", err);
-		/* Continue anyway - some platforms might not support this */
-	}
-#endif
-	
-	/* Give the UART some time to stabilize */
-	k_msleep(CONFIG_APP_UART_SENSOR_DEVICE_SETTLE_DELAY_MS);
-	
-	/* Clear any pending interrupts */
-	uart_irq_update(uart_dev);
+	LOG_INF("UART device ready, configuring interrupt handler");
 	
 	/* Set the interrupt-driven callback */
-	uart_irq_callback_user_data_set(uart_dev, uart_isr_callback, NULL);
-	
-	/* Disable all interrupts first */
-	uart_irq_tx_disable(uart_dev);
-	uart_irq_rx_disable(uart_dev);
-	
-	/* Clear FIFO */
-	while (uart_irq_rx_ready(uart_dev)) {
-		uint8_t dummy;
-		uart_fifo_read(uart_dev, &dummy, 1);
+	int ret = uart_irq_callback_user_data_set(uart_dev, uart_isr_callback, NULL);
+	if (ret != 0) {
+		LOG_ERR("Failed to set UART callback: %d", ret);
+		return ret;
 	}
 	
-	/* Enable RX interrupt only */
+	/* Enable RX interrupt */
 	uart_irq_rx_enable(uart_dev);
 	
 	LOG_INF("UART interrupt-driven handler initialized and listening");
@@ -498,6 +512,72 @@ int uart_sensor_process_data_line(const char *data)
 	const char *field_sep = UART_FIELD_SEPARATOR;
 	const char *value_sep = UART_VALUE_SEPARATOR;
 	
+	/* --- New Gateway Interface Parsing --- */
+	
+	/* 1. Errors (ERR:<msg>) */
+	if (strncmp(data, "ERR:", 4) == 0) {
+		LOG_WRN("UART Remote Error: %s", data);
+		uart_error_handler(UART_SENSOR_ERROR_REMOTE_ERROR, data + 4);
+		return 0;
+	}
+	
+	/* 2. Status (STATUS:<data>) */
+	if (strncmp(data, "STATUS:", 7) == 0) {
+		LOG_INF("UART Status: %s", data + 7);
+		
+		k_mutex_lock(&uart_data_mutex, K_FOREVER);
+		current_sensor_data.type = UART_SENSOR_GENERIC_RESPONSE;
+		strncpy(current_sensor_data.response_text, data, sizeof(current_sensor_data.response_text) - 1);
+		current_sensor_data.response_text[sizeof(current_sensor_data.response_text) - 1] = '\0';
+		k_mutex_unlock(&uart_data_mutex);
+		
+		goto publish_generic;
+	}
+	
+	/* 3. Sensor List (SENSORS_LIST_START, SENSORS_LIST_END, list entries) */
+	if (strncmp(data, "SENSORS_LIST", 12) == 0 || strstr(data, "addr=") != NULL) {
+		/* Forward list control messages and list entries as generic info */
+		LOG_INF("UART List Info: %s", data);
+		
+		k_mutex_lock(&uart_data_mutex, K_FOREVER);
+		current_sensor_data.type = UART_SENSOR_GENERIC_RESPONSE;
+		strncpy(current_sensor_data.response_text, data, sizeof(current_sensor_data.response_text) - 1);
+		current_sensor_data.response_text[sizeof(current_sensor_data.response_text) - 1] = '\0';
+		k_mutex_unlock(&uart_data_mutex);
+		
+		goto publish_generic;
+	}
+	
+	/* 4. Connection Events (CONNECTING..., DISCONNECTING..., SEND_OK) */
+	if (strncmp(data, "CONNECTING", 10) == 0 || 
+	    strncmp(data, "DISCONNECTING", 13) == 0 || 
+	    strncmp(data, "SEND_OK", 7) == 0) {
+		LOG_INF("UART Connection Event: %s", data);
+		
+		k_mutex_lock(&uart_data_mutex, K_FOREVER);
+		current_sensor_data.type = UART_SENSOR_GENERIC_RESPONSE;
+		strncpy(current_sensor_data.response_text, data, sizeof(current_sensor_data.response_text) - 1);
+		current_sensor_data.response_text[sizeof(current_sensor_data.response_text) - 1] = '\0';
+		k_mutex_unlock(&uart_data_mutex);
+		
+		goto publish_generic;
+	}
+	
+	/* 5. RX Data (RX_FROM_SENSOR:<data>) */
+	if (strncmp(data, "RX_FROM_SENSOR:", 15) == 0) {
+		LOG_INF("UART RX Data: %s", data + 15);
+		
+		k_mutex_lock(&uart_data_mutex, K_FOREVER);
+		current_sensor_data.type = UART_SENSOR_GENERIC_RESPONSE;
+		strncpy(current_sensor_data.response_text, data, sizeof(current_sensor_data.response_text) - 1);
+		current_sensor_data.response_text[sizeof(current_sensor_data.response_text) - 1] = '\0';
+		k_mutex_unlock(&uart_data_mutex);
+		
+		goto publish_generic;
+	}
+
+	/* --- Legacy Sensor Reporting Format (<name>:<temp>,<hum>,<bat>) --- */
+	
 	/* Build format string dynamically based on configuration */
 	char format_str[64];
 	snprintf(format_str, sizeof(format_str), "%%%d[^%s]%s%%f%s%%f%s%%u",
@@ -507,14 +587,16 @@ int uart_sensor_process_data_line(const char *data)
 
 	if (items_parsed == 4) {
 		parse_success = true;
-		LOG_INF("Parsed UART data: Name=%s, Temp=%.1f°C, Hum=%.1f%%, Batt=%umV", 
+		LOG_INF("[UART PARSED]: ID='%s', Temp=%.1f, Hum=%.1f, Batt=%u", 
 			sensor_name, (double)temperature, (double)humidity, probe_battery_mv);
 
-		/* Validate probe ID */
+
+		/* Validate probe ID - reject if invalid */
 		if (!validate_probe_id(sensor_name)) {
-			LOG_WRN("Invalid probe ID, using default: %s", UART_DEFAULT_PROBE_ID);
-			strncpy(sensor_name, UART_DEFAULT_PROBE_ID, sizeof(sensor_name) - 1);
-			sensor_name[sizeof(sensor_name) - 1] = '\0';
+			LOG_WRN("Invalid probe ID: %s", sensor_name);
+			uart_error_handler(UART_SENSOR_ERROR_PARSE_FAILED, "Invalid probe ID");
+			parse_success = false;
+			return -EINVAL;
 		}
 
 		/* Update current sensor data with thread safety */
@@ -589,12 +671,30 @@ int uart_sensor_process_data_line(const char *data)
 		update_statistics(parse_success, validation_success, publish_success);
 		return 0;
 	} else {
-		LOG_WRN("Failed to parse UART data: '%s'. Parsed %d items, expected 4", 
-			data, items_parsed);
-		uart_error_handler(UART_SENSOR_ERROR_PARSE_FAILED, "Invalid data format");
-		update_statistics(false, false, false);
-		return -EINVAL;
+		/* Not a legacy sensor format - forward as generic response */
+		LOG_INF("UART Generic Data: %s", data);
+		
+		k_mutex_lock(&uart_data_mutex, K_FOREVER);
+		current_sensor_data.type = UART_SENSOR_GENERIC_RESPONSE;
+		strncpy(current_sensor_data.response_text, data, sizeof(current_sensor_data.response_text) - 1);
+		current_sensor_data.response_text[sizeof(current_sensor_data.response_text) - 1] = '\0';
+		k_mutex_unlock(&uart_data_mutex);
+		
+		goto publish_generic;
 	}
+
+publish_generic:
+	/* Helper to publish generic messages */
+	if (uart_module_state.auto_publish_enabled) {
+		int err = zbus_chan_pub(&UART_SENSOR_CHAN, &current_sensor_data, 
+					K_MSEC(UART_ZBUS_TIMEOUT_MS));
+		if (err) {
+			LOG_ERR("Failed to publish generic UART data: %d", err);
+			return err;
+		}
+	}
+	update_statistics(true, true, true);
+	return 0;
 }
 
 /* Public API functions */
@@ -750,22 +850,22 @@ static int uart_sensor_module_init(void)
 		return err;
 	}
 	
-	/* Initialize with sensible default values */
+	/* Initialize with empty values (no simulated data) */
 	k_mutex_lock(&uart_data_mutex, K_FOREVER);
 	current_sensor_data.type = UART_SENSOR_DATA_RESPONSE;
-	current_sensor_data.temperature = 25.0f; /* Room temperature default */
-	current_sensor_data.humidity = 50.0f; /* Moderate humidity default */
-	current_sensor_data.probe_battery = 85.0f; /* Good battery level default */
+	current_sensor_data.temperature = 0.0f;
+	current_sensor_data.humidity = 0.0f;
+	current_sensor_data.probe_battery = 0.0f;
 	current_sensor_data.error_type = UART_SENSOR_ERROR_NONE;
-	strncpy(current_sensor_data.probe_id, UART_DEFAULT_PROBE_ID, sizeof(current_sensor_data.probe_id));
-	current_sensor_data.probe_id[sizeof(current_sensor_data.probe_id) - 1] = '\0';
+	/* Empty probe ID indicates no sensor connected */
+	current_sensor_data.probe_id[0] = '\0';
 	current_sensor_data.timestamp = k_uptime_get();
 	
-	/* Initialize data quality indicators */
-	current_sensor_data.data_quality.temperature_valid = true;
-	current_sensor_data.data_quality.humidity_valid = true;
-	current_sensor_data.data_quality.battery_valid = true;
-	current_sensor_data.data_quality.probe_id_valid = true;
+	/* Initialize data quality indicators to false */
+	current_sensor_data.data_quality.temperature_valid = false;
+	current_sensor_data.data_quality.humidity_valid = false;
+	current_sensor_data.data_quality.battery_valid = false;
+	current_sensor_data.data_quality.probe_id_valid = false;
 	
 	/* Clear error details */
 	memset(current_sensor_data.error_details, 0, sizeof(current_sensor_data.error_details));
@@ -797,6 +897,38 @@ static int uart_sensor_module_init(void)
 	
 	return 0;
 }
+
+
+
+
+
+/* ZBUS listener for UART sensor module */
+static void uart_sensor_zbus_callback(const struct zbus_channel *chan)
+{
+	const struct custom_mqtt_msg *msg;
+
+	LOG_INF(">>> uart_sensor_zbus_callback triggered <<<");
+	
+	if (&CUSTOM_MQTT_CHAN == chan) {
+		msg = zbus_chan_const_msg(chan);
+		
+		LOG_INF("CUSTOM_MQTT_CHAN message received, type=%d", msg->type);
+		
+		if (msg->type == CUSTOM_MQTT_EVT_FORWARD_UART) {
+			LOG_INF("Received UART forward request from MQTT");
+			if (msg->forward_uart.data) {
+				LOG_INF("Forwarding to UART: %s (len=%zu)", 
+					msg->forward_uart.data, msg->forward_uart.len);
+				uart_sensor_send_command(msg->forward_uart.data);
+			} else {
+				LOG_ERR("UART forward data pointer is NULL!");
+			}
+		}
+	}
+}
+
+ZBUS_LISTENER_DEFINE(uart_sensor_listener, uart_sensor_zbus_callback);
+ZBUS_CHAN_ADD_OBS(CUSTOM_MQTT_CHAN, uart_sensor_listener, 0);
 
 /* Initialize the UART sensor module at system startup */
 SYS_INIT(uart_sensor_module_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
