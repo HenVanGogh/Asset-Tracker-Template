@@ -29,7 +29,7 @@ extern "C" {
 #define MQTT_RECONNECT_BASE_DELAY_SEC   5
 #define MQTT_RECONNECT_MAX_DELAY_SEC    300
 #define MQTT_MAX_PUBLISH_FAILURES       10
-#define MQTT_HEARTBEAT_INTERVAL_SEC     30
+#define MQTT_HEARTBEAT_INTERVAL_SEC     300  /* 5 minutes between heartbeats */
 #define MQTT_CONNECTION_TIMEOUT_SEC     30
 #define MQTT_LOCATION_UPDATE_INTERVAL_SEC 300  /* 5 minutes between location updates */
 

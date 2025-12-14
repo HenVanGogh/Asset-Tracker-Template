@@ -98,37 +98,22 @@ static void uart_isr_callback(const struct device *dev, void *user_data)
 		/* Process received bytes and assemble complete lines */
 		for (int i = 0; i < recv_len; i++) {
 			uint8_t c = buffer[i];
-			LOG_INF("ISR RX: %02x ('%c')", c, (c >= ' ' && c <= '~') ? c : '.');
 			
-			/* Check for line termination characters */
-			bool is_line_end = false;
-			const char *delim = UART_MESSAGE_DELIMITER;
-			
-			/* Check configured delimiters */
-			for (int j = 0; delim[j] != '\0'; j++) {
-				if (c == delim[j]) {
-					is_line_end = true;
-					break;
-				}
-			}
-			/* Also check standard carriage return and newline as nRF5340 might use it */
-			if (c == '\r' || c == '\n') {
-				is_line_end = true;
-			}
+			/* Check for line termination (CR or LF) */
+			bool is_line_end = (c == '\r' || c == '\n');
 			
 			if (is_line_end) {
 				if (line_buf_pos > 0) {
 					/* Complete line received - null terminate and queue for processing */
 					line_buf[line_buf_pos] = '\0';
 					
-					LOG_INF(">>> UART LINE COMPLETE (%d chars): '%s' <<<", 
-							line_buf_pos, line_buf);
+					LOG_DBG("UART line complete: %d chars", line_buf_pos);
 					
 					if (k_msgq_put(&uart_msgq, line_buf, K_NO_WAIT) != 0) {
 						LOG_WRN("UART message queue full, dropping message: %s", line_buf);
 						uart_error_handler(UART_SENSOR_ERROR_BUFFER_OVERFLOW, "Message queue full");
 					} else {
-						LOG_INF(">>> UART RX queued (%d chars): %s", line_buf_pos, line_buf);
+						LOG_DBG("UART RX queued: %d chars", line_buf_pos);
 						k_sem_give(&uart_wake_sem);
 					}
 					
@@ -156,15 +141,22 @@ int uart_sensor_send_command(const char *cmd)
 		return -EINVAL;
 	}
 
+	/* Validate command length */
+	size_t cmd_len = strlen(cmd);
+	if (cmd_len == 0 || cmd_len > UART_LINE_BUF_SIZE - 3) {
+		LOG_ERR("Invalid command length: %zu (max: %d)", cmd_len, UART_LINE_BUF_SIZE - 3);
+		return -EINVAL;
+	}
+
 	if (!device_is_ready(uart_dev)) {
 		LOG_ERR("UART device not ready");
 		return -ENODEV;
 	}
 
-	LOG_INF("Sending UART command: %s", cmd);
+	LOG_DBG("Sending UART command: %s", cmd);
 
 	/* Transmit command string */
-	for (int i = 0; cmd[i] != '\0'; i++) {
+	for (size_t i = 0; i < cmd_len; i++) {
 		uart_poll_out(uart_dev, cmd[i]);
 	}
 
@@ -399,7 +391,7 @@ static void uart_processing_thread(void *p1, void *p2, void *p3)
 		
 		/* Process all pending UART messages */
 		while (k_msgq_get(&uart_msgq, &rx_buf, K_NO_WAIT) == 0) {
-			LOG_INF("[RAW UART RX]: '%s'", rx_buf);
+			LOG_DBG("UART RX: %s", rx_buf);
 			
 			/* Process the received line */
 			int ret = uart_sensor_process_data_line(rx_buf);
@@ -523,7 +515,7 @@ int uart_sensor_process_data_line(const char *data)
 	
 	/* 2. Status (STATUS:<data>) */
 	if (strncmp(data, "STATUS:", 7) == 0) {
-		LOG_INF("UART Status: %s", data + 7);
+		LOG_DBG("UART Status: %s", data + 7);
 		
 		k_mutex_lock(&uart_data_mutex, K_FOREVER);
 		current_sensor_data.type = UART_SENSOR_GENERIC_RESPONSE;
@@ -537,7 +529,7 @@ int uart_sensor_process_data_line(const char *data)
 	/* 3. Sensor List (SENSORS_LIST_START, SENSORS_LIST_END, list entries) */
 	if (strncmp(data, "SENSORS_LIST", 12) == 0 || strstr(data, "addr=") != NULL) {
 		/* Forward list control messages and list entries as generic info */
-		LOG_INF("UART List Info: %s", data);
+		LOG_DBG("UART List: %s", data);
 		
 		k_mutex_lock(&uart_data_mutex, K_FOREVER);
 		current_sensor_data.type = UART_SENSOR_GENERIC_RESPONSE;
@@ -548,11 +540,13 @@ int uart_sensor_process_data_line(const char *data)
 		goto publish_generic;
 	}
 	
-	/* 4. Connection Events (CONNECTING..., DISCONNECTING..., SEND_OK) */
+	/* 4. Connection and Command Events */
 	if (strncmp(data, "CONNECTING", 10) == 0 || 
 	    strncmp(data, "DISCONNECTING", 13) == 0 || 
-	    strncmp(data, "SEND_OK", 7) == 0) {
-		LOG_INF("UART Connection Event: %s", data);
+	    strncmp(data, "AUTO_CONNECTING", 15) == 0 ||
+	    strncmp(data, "SEND_OK", 7) == 0 ||
+	    strncmp(data, "SEND_ALL_OK", 11) == 0) {
+		LOG_DBG("UART Event: %s", data);
 		
 		k_mutex_lock(&uart_data_mutex, K_FOREVER);
 		current_sensor_data.type = UART_SENSOR_GENERIC_RESPONSE;
@@ -565,7 +559,7 @@ int uart_sensor_process_data_line(const char *data)
 	
 	/* 5. RX Data (RX_FROM_SENSOR:<data>) */
 	if (strncmp(data, "RX_FROM_SENSOR:", 15) == 0) {
-		LOG_INF("UART RX Data: %s", data + 15);
+		LOG_DBG("UART RX Data: %s", data + 15);
 		
 		k_mutex_lock(&uart_data_mutex, K_FOREVER);
 		current_sensor_data.type = UART_SENSOR_GENERIC_RESPONSE;

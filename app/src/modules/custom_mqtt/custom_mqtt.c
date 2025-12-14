@@ -295,7 +295,8 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 					    strcmp(type->valuestring, "uart_passthrough") == 0 &&
 					    command && cJSON_IsString(command)) {
 						/* Handle uart_passthrough: forward command directly to UART */
-						LOG_INF("UART passthrough command: %s", command->valuestring);
+						/* No MQTT acknowledgment - just forward silently */
+						LOG_DBG("UART passthrough: %s", command->valuestring);
 						
 						/* Publish forward request to ZBUS */
 						msg.type = CUSTOM_MQTT_EVT_FORWARD_UART;
@@ -303,8 +304,10 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 						msg.forward_uart.len = strlen(command->valuestring);
 						zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
 						
-						cJSON_AddStringToObject(response, "status", "uart_passthrough_sent");
-						cJSON_AddStringToObject(response, "uart_command", command->valuestring);
+						/* Clean up and skip publishing response */
+						cJSON_Delete(received_json);
+						cJSON_Delete(response);
+						goto publish_skip;
 					} else if (command && cJSON_IsString(command)) {
 						LOG_INF("Processing command: %s", command->valuestring);
 						
@@ -320,12 +323,7 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 						} else if (strcmp(command->valuestring, "get_status") == 0) {
 							LOG_INF("Status request received via MQTT");
 							
-							/* Forward "status" command to UART to get sensor status */
-							msg.type = CUSTOM_MQTT_EVT_FORWARD_UART;
-							msg.forward_uart.data = "status";
-							msg.forward_uart.len = 6;
-							zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
-							
+							/* Return gateway status only - no UART forwarding */
 							cJSON_AddStringToObject(response, "status", "online");
 							cJSON_AddNumberToObject(response, "uptime_ms", k_uptime_get());
 							cJSON_AddNumberToObject(response, "mqtt_state", mqtt_ctx.state);
@@ -371,6 +369,8 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 				}
 				cJSON_Delete(response);
 			}
+			
+publish_skip:
 			
 			msg.type = CUSTOM_MQTT_EVT_DATA_RECEIVED;
 			msg.data_received.data = (char *)mqtt_ctx.payload_buf;
