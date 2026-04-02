@@ -5,34 +5,51 @@
 #
 
 menuconfig APP_FOTA
-	bool "FOTA"
-	default y if (!BOARD_NATIVE_POSIX && NRF_CLOUD_FOTA_POLL)
+	bool "FOTA via HTTP/HTTPS (MQTT-triggered)"
+	default n
+	help
+	  Enable HTTP/HTTPS firmware update triggered by an MQTT command.
+	  Does NOT require nRF Cloud. The device downloads the binary from
+	  any HTTP/HTTPS URL, writes it to the MCUboot secondary slot, and
+	  reboots to apply.
 
 if APP_FOTA
 
+config APP_FOTA_URL_MAX_LEN
+	int "Maximum length of FOTA download URL"
+	default 256
+
+config APP_FOTA_SEC_TAG
+	int "Default TLS security tag for FOTA downloads"
+	default -1
+	help
+	  Set to -1 to disable TLS certificate verification (plain HTTP or
+	  unverified HTTPS — development only).
+	  Set to a provisioned modem sec_tag (>= 0) to enable TLS certificate
+	  verification for HTTPS downloads.
+	  The CA certificate must be provisioned at this tag using AT%CMNG
+	  before the FOTA update is triggered.
+	  The MQTT command can override this value per-request.
+
 config APP_FOTA_THREAD_STACK_SIZE
 	int "Thread stack size"
-	default 2500
+	default 4096
 
 config APP_FOTA_WATCHDOG_TIMEOUT_SECONDS
 	int "Watchdog timeout"
-	default 210
+	default 600
 	help
 	  Timeout in seconds for the FOTA module watchdog.
-	  The timeout given in this option covers both:
-	    * Waiting for an incoming message in zbus_sub_wait_msg().
-	    * Time spent processing the message, defined by
-	      CONFIG_APP_FOTA_MSG_PROCESSING_TIMEOUT_SECONDS.
-	  Ensure that this value exceeds CONFIG_APP_FOTA_MSG_PROCESSING_TIMEOUT_SECONDS.
-	  A small difference between the two can mean more frequent watchdog feeds, which increases
-	  power consumption.
+	  Must be greater than APP_FOTA_MSG_PROCESSING_TIMEOUT_SECONDS.
+	  A typical firmware download over LTE-M for a 350KB image takes
+	  30–120 seconds. 600 seconds (10 minutes) gives ample margin.
 
 config APP_FOTA_MSG_PROCESSING_TIMEOUT_SECONDS
 	int "Maximum message processing time"
-	default 180
+	default 540
 	help
-	  Maximum time allowed for processing a single message in the module's state machine.
-	  The value must be smaller than CONFIG_APP_FOTA_WATCHDOG_TIMEOUT_SECONDS.
+	  Maximum time allowed for processing a single message.
+	  Must be smaller than APP_FOTA_WATCHDOG_TIMEOUT_SECONDS.
 
 module = APP_FOTA
 module-str = FOTA

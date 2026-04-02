@@ -42,6 +42,9 @@
 
 #if defined(CONFIG_APP_UART_SENSOR)
 #include "uart_sensor.h"
+#if defined(CONFIG_APP_FOTA)
+#include "fota.h"
+#endif
 #endif
 
 #if defined(CONFIG_APP_BUTTON)
@@ -270,6 +273,9 @@ static sec_tag_t sec_tag_list[] = { CONFIG_APP_CUSTOM_MQTT_SEC_TAG };
 
 /* Declare external ZBUS channels defined in other modules */
 ZBUS_CHAN_DECLARE(TIMER_CHAN);
+#if defined(CONFIG_APP_FOTA)
+ZBUS_CHAN_DECLARE(FOTA_CHAN);
+#endif
 
 /* Register zbus subscriber */
 ZBUS_MSG_SUBSCRIBER_DEFINE(custom_mqtt_subscriber);
@@ -980,6 +986,62 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 								cJSON_AddStringToObject(response, "hint",
 									"{\"command\":\"set_power_mode\",\"mode\":\"high\"}");
 							}
+
+#if defined(CONFIG_APP_FOTA)
+						} else if (strcmp(command->valuestring, "fota_start") == 0) {
+							/* Trigger HTTP/HTTPS firmware download.
+							 * Required: "url" — full URL to firmware .bin
+							 * Optional: "sec_tag" — modem TLS credential tag (default: CONFIG_APP_FOTA_SEC_TAG)
+							 * Example: {"command":"fota_start","url":"https://t4as.org/thingyupdate"} */
+							cJSON *url_j = cJSON_GetObjectItem(received_json, "url");
+							if (url_j && cJSON_IsString(url_j) && strlen(url_j->valuestring) > 0) {
+								cJSON *tag_j = cJSON_GetObjectItem(received_json, "sec_tag");
+								int sec_tag = CONFIG_APP_FOTA_SEC_TAG;
+								if (tag_j && cJSON_IsNumber(tag_j)) {
+									sec_tag = tag_j->valueint;
+								}
+								int fota_ret = fota_http_trigger(url_j->valuestring, sec_tag);
+								if (fota_ret == 0) {
+									cJSON_AddStringToObject(response, "status", "fota_starting");
+									cJSON_AddStringToObject(response, "url", url_j->valuestring);
+									cJSON_AddNumberToObject(response, "sec_tag", sec_tag);
+									cJSON_AddStringToObject(response, "note",
+										"Device will download and reboot to apply update");
+									LOG_INF("FOTA triggered via MQTT: %s (sec_tag=%d)",
+										url_j->valuestring, sec_tag);
+								} else {
+									cJSON_AddStringToObject(response, "status", "fota_error");
+									cJSON_AddNumberToObject(response, "error_code", fota_ret);
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_url");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"fota_start\",\"url\":\"https://t4as.org/thingyupdate\"}");
+							}
+
+						} else if (strcmp(command->valuestring, "fota_cancel") == 0) {
+							enum fota_msg_type cancel_msg = FOTA_DOWNLOAD_CANCEL;
+							int ret = zbus_chan_pub(&FOTA_CHAN, &cancel_msg, K_MSEC(500));
+							if (ret == 0) {
+								cJSON_AddStringToObject(response, "status", "cancel_requested");
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddNumberToObject(response, "error_code", ret);
+							}
+
+						} else if (strcmp(command->valuestring, "fota_status") == 0) {
+							int progress = fota_get_progress();
+							cJSON_AddStringToObject(response, "status", "ok");
+							if (progress < 0) {
+								cJSON_AddStringToObject(response, "fota", "idle");
+							} else if (progress == 100) {
+								cJSON_AddStringToObject(response, "fota", "complete_reboot_pending");
+							} else {
+								cJSON_AddStringToObject(response, "fota", "downloading");
+								cJSON_AddNumberToObject(response, "progress_pct", progress);
+							}
+							cJSON_AddStringToObject(response, "version", APP_VERSION_STRING);
+#endif /* CONFIG_APP_FOTA */
 
 						} else {
 							/* Unknown command — do NOT forward to UART blindly.

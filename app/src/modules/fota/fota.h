@@ -58,6 +58,27 @@ enum fota_msg_type {
 
 #define MSG_TO_FOTA_TYPE(_msg) (*(const enum fota_msg_type *)_msg)
 
+/**
+ * @brief Trigger an HTTP(S) firmware download.
+ *
+ * Stores the URL and security tag, then publishes FOTA_POLL_REQUEST on
+ * FOTA_CHAN to kick off the download state machine.
+ *
+ * @param url      Full URL of firmware binary (e.g. "https://t4as.org/thingyupdate").
+ * @param sec_tag  Modem TLS security tag with provisioned CA cert (>= 0),
+ *                 or -1 to skip TLS certificate verification (plain HTTP).
+ * @return 0 on success, negative errno on failure.
+ */
+int fota_http_trigger(const char *url, int sec_tag);
+
+/**
+ * @brief Get the current FOTA download progress.
+ *
+ * @return Download progress in percent (0-100), or -1 if no download is in
+ *         progress.
+ */
+int fota_get_progress(void);
+
 #ifdef __cplusplus
 }
 #endif
