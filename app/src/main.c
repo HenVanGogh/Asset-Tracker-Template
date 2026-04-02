@@ -378,15 +378,11 @@ static void sensor_and_poll_triggers_send(void)
 #endif /* CONFIG_APP_UART_SENSOR */
 
 #if defined(CONFIG_APP_FOTA)
-	/* Send FOTA poll trigger */
-	enum fota_msg_type fota_msg = FOTA_POLL_REQUEST;
-
-	err = zbus_chan_pub(&FOTA_CHAN, &fota_msg, K_NO_WAIT);
-	if (err) {
-		LOG_ERR("zbus_chan_pub FOTA trigger, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
-	}
+	/* FOTA is triggered only by MQTT command (fota_start).
+	 * Do NOT auto-poll here — the URL is set by the MQTT handler;
+	 * triggering FOTA_POLL_REQUEST without a URL would attempt a download
+	 * with an empty URL on every data sample cycle.
+	 */
 #endif /* CONFIG_APP_FOTA */
 }
 

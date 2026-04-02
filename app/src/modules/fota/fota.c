@@ -118,7 +118,11 @@ static void parse_url(const char *url,
 
 		strncpy(host_buf, p, hlen);
 		host_buf[hlen] = '\0';
-		strncpy(file_buf, slash, file_sz - 1);
+		/* Skip the leading '/' — downloader adds its own separator:
+		 * downloader_get_with_host_and_file() does snprintf("%s/%s", host, file)
+		 * so passing "/path" would produce "host//path".
+		 */
+		strncpy(file_buf, slash + 1, file_sz - 1);
 		file_buf[file_sz - 1] = '\0';
 	} else {
 		strncpy(host_buf, p, host_sz - 1);
