@@ -51,13 +51,19 @@ extern "C" {
 #define UART_RECOVERY_DELAY_MS       CONFIG_APP_UART_SENSOR_RECOVERY_DELAY_MS
 #endif
 
+/* ESL polling interval (seconds) */
+#define ESL_POLL_INTERVAL_SEC        CONFIG_APP_UART_SENSOR_ESL_POLL_INTERVAL_SEC
+
+/* Maximum number of ESL tags we track */
+#define ESL_MAX_TAGS                 CONFIG_APP_UART_SENSOR_ESL_MAX_TAGS
+
 /* ZBUS channel for UART sensor module communication */
 ZBUS_CHAN_DECLARE(UART_SENSOR_CHAN);
 
 enum uart_sensor_msg_type {
 	/* Output message types */
 
-	/** Response message containing sensor data from external probe. */
+	/** Response message containing sensor data from ESL tag (NUS status). */
 	UART_SENSOR_DATA_RESPONSE = 0x1,
 
 	/** Error message indicating communication or data validation failure. */
@@ -66,14 +72,35 @@ enum uart_sensor_msg_type {
 	/** Statistics message containing performance and error counters. */
 	UART_SENSOR_STATS_RESPONSE = 0x3,
 
-	/** Generic response message containing text data from UART. */
+	/** Generic response message containing text data from UART (shell output). */
 	UART_SENSOR_GENERIC_RESPONSE = 0x4,
+
+	/** ESL tag discovered during BLE scan. */
+	UART_SENSOR_ESL_TAG_FOUND = 0x5,
+
+	/** ESL tag connected. */
+	UART_SENSOR_ESL_TAG_CONNECTED = 0x6,
+
+	/** ESL tag configured and synchronized. */
+	UART_SENSOR_ESL_TAG_CONFIGURED = 0x7,
+
+	/** ESL NUS response (status/sensors from tag). */
+	UART_SENSOR_ESL_NUS_RESPONSE = 0x8,
+
+	/** nRF5340 boot detected. */
+	UART_SENSOR_ESL_AP_READY = 0x9,
+
+	/** ESL tag disconnected from BLE. */
+	UART_SENSOR_ESL_TAG_DISCONNECTED = 0xA,
+
+	/** Sensor name received via #SENSOR_NAME event from nRF5340. */
+	UART_SENSOR_ESL_NAME_RESPONSE = 0xB,
 
 	/* Input message types */
 
-	/** Request to sample sensor data from external probe via UART. */
+	/** Request to sample sensor data from all ESL tags. */
 	UART_SENSOR_DATA_REQUEST = 0x10,
-	
+
 	/** Request to reset error counters and statistics. */
 	UART_SENSOR_RESET_STATS_REQUEST = 0x11,
 
@@ -89,25 +116,40 @@ enum uart_sensor_error_type {
 	UART_SENSOR_ERROR_DEVICE_NOT_READY,
 	UART_SENSOR_ERROR_BUFFER_OVERFLOW,
 	UART_SENSOR_ERROR_VALIDATION_FAILED,
-	UART_SENSOR_ERROR_REMOTE_ERROR, /* Error reported by the remote device (ERR:...) */
+	UART_SENSOR_ERROR_REMOTE_ERROR,
+};
+
+/** ESL tag info from NUS status response */
+struct esl_tag_info {
+	uint16_t esl_addr;
+	char     mac[18];            /* "XX:XX:XX:XX:XX:XX" */
+	uint32_t uptime_s;
+	uint16_t battery_mv;
+	uint8_t  flags;
+	float    temperature;        /* °C, from NUS sensors or ECP sensor */
+	int8_t   rssi;
+	int64_t  last_seen;          /* uptime when last heard from */
+	bool     valid;
+	bool     connected;          /* true while BLE link is active */
+	char     name[13];           /* human-readable sensor name, from #SENSOR_NAME event */
 };
 
 struct uart_sensor_msg {
 	enum uart_sensor_msg_type type;
 
-	/** Temperature reading from external probe in degrees Celsius. */
+	/** Temperature reading from ESL tag in degrees Celsius. */
 	float temperature;
 
-	/** Humidity reading from external probe in percentage (0-100). */
+	/** Humidity reading (not always available from ESL tags). */
 	float humidity;
 
-	/** Probe identifier string (plain name, not formatted). */
+	/** Probe/tag identifier string. */
 	char probe_id[CONFIG_APP_UART_SENSOR_PROBE_ID_MAX_LEN + 1];
 
-	/** Battery level of the external probe in percentage (0-100). */
+	/** Battery level of the tag in percentage (0-100). */
 	float probe_battery;
 
-	/** Timestamp of the sample in milliseconds since epoch. */
+	/** Timestamp of the sample in milliseconds since boot. */
 	int64_t timestamp;
 
 	/** Error information (if type is UART_SENSOR_ERROR_RESPONSE). */
@@ -115,9 +157,12 @@ struct uart_sensor_msg {
 
 	/** Additional error details or status information. */
 	char error_details[64];
-	
-	/** Generic response text (if type is UART_SENSOR_GENERIC_RESPONSE). */
+
+	/** Generic response text (raw shell output from nRF5340). */
 	char response_text[128];
+
+	/** ESL tag detailed info (for ESL_NUS_RESPONSE type). */
+	struct esl_tag_info tag_info;
 
 	/** Data quality indicators. */
 	struct {
@@ -129,128 +174,95 @@ struct uart_sensor_msg {
 };
 
 struct uart_sensor_stats {
-	/** Total number of messages received. */
 	uint32_t messages_received;
-
-	/** Number of successfully parsed messages. */
 	uint32_t messages_parsed;
-
-	/** Number of messages that failed parsing. */
 	uint32_t parse_errors;
-
-	/** Number of messages with invalid data. */
 	uint32_t validation_errors;
-
-	/** Number of ZBUS publish failures. */
 	uint32_t publish_errors;
-
-	/** Number of UART communication errors. */
 	uint32_t comm_errors;
-
-	/** Last error timestamp. */
 	int64_t last_error_time;
-
-	/** Module uptime in milliseconds. */
 	int64_t uptime_ms;
 };
 
 #define MSG_TO_UART_SENSOR_MSG(_msg)	(*(const struct uart_sensor_msg *)_msg)
 
-/* Function declarations */
+/* ---- Public API ---- */
 
-/** @brief Initialize UART sensor module
- *
- * Initializes UART communication for external sensor probes.
- * This function is called automatically during system initialization.
- *
- * @return 0 on success, negative error code on failure
- */
 int uart_sensor_init(void);
-
-/** @brief Request a UART sensor sample and publish the result
- *
- * Triggers immediate publication of the most recent sensor data.
- * If auto-publication is disabled, this is the primary way to get data.
- *
- * @return 0 on success, negative error code on failure
- */
 int uart_sensor_sample_request(void);
-
-/** @brief Send a raw command string to the UART sensor.
- *
- * Appends a newline if one is not present.
- *
- * @param cmd Null-terminated command string to send
- * @return 0 on success, negative error code on failure
- */
 int uart_sensor_send_command(const char *cmd);
-
-/** @brief Get current UART sensor data
- *
- * Retrieves the most recently received sensor data without triggering
- * a new measurement or publication.
- *
- * @param data Pointer to uart_sensor_msg structure to fill with current data
- * @return 0 on success, negative error code on failure
- */
 int uart_sensor_get_current_data(struct uart_sensor_msg *data);
-
-/** @brief Check UART sensor status and configuration
- *
- * Provides detailed status information about the UART sensor module,
- * including device readiness, error counts, and configuration.
- *
- * @return 0 on success, negative error code on failure
- */
 int uart_sensor_check_status(void);
-
-/** @brief Get UART sensor statistics
- *
- * Retrieves performance and error statistics for the UART sensor module.
- *
- * @param stats Pointer to uart_sensor_stats structure to fill
- * @return 0 on success, negative error code on failure
- */
 int uart_sensor_get_stats(struct uart_sensor_stats *stats);
-
-/** @brief Reset UART sensor statistics
- *
- * Resets all error counters and performance statistics to zero.
- *
- * @return 0 on success, negative error code on failure
- */
 int uart_sensor_reset_stats(void);
-
-/** @brief Process UART data line
- *
- * Parses a received UART data line and extracts sensor information.
- * This function is typically called from the UART interrupt handler
- * or processing thread.
- *
- * @param data The null-terminated string received from UART
- * @return 0 on success, negative error code on failure
- */
 int uart_sensor_process_data_line(const char *data);
-
-/** @brief Enable or disable automatic data publication
- *
- * Controls whether sensor data is automatically published via ZBUS
- * when received from the UART.
- *
- * @param enable true to enable auto-publication, false to disable
- * @return 0 on success, negative error code on failure
- */
 int uart_sensor_set_auto_publish(bool enable);
-
-/** @brief Validate sensor data against configured limits
- *
- * Checks if the provided sensor data is within acceptable ranges
- * as defined by Kconfig settings.
- *
- * @param msg Pointer to sensor message to validate
- * @return true if data is valid, false otherwise
- */
 bool uart_sensor_validate_data(const struct uart_sensor_msg *msg);
+
+/** @brief Send an ESL AP shell command (prepends "esl_c " if not present). */
+int uart_sensor_esl_command(const char *esl_cmd);
+
+/** @brief Trigger a scan for ESL tags (sends: esl_c acl scan 1 1). */
+int uart_sensor_esl_scan_start(void);
+
+/** @brief Stop ESL scan. */
+int uart_sensor_esl_scan_stop(void);
+
+/** @brief Request NUS status from an ESL tag (sends: esl_c nus status <id>). */
+int uart_sensor_esl_nus_status(uint16_t esl_id);
+
+/** @brief Request NUS sensors from an ESL tag (sends: esl_c nus sensors <id>). */
+int uart_sensor_esl_nus_sensors(uint16_t esl_id);
+
+/**
+ * @brief Request the human-readable name from an ESL tag via NUS GET_NAME (0x06).
+ *        Pass esl_id=0xFFFF to request from all currently tracked tags.
+ *        The response arrives asynchronously as a #SENSOR_NAME SPI event and is
+ *        published to MQTT via UART_SENSOR_ESL_NAME_RESPONSE.
+ */
+int uart_sensor_esl_get_name(uint16_t esl_id);
+
+/**
+ * @brief Force-push the current LTE UTC epoch to the nRF5340 AP via SPI
+ *        (AP_SET_TIME:<epoch>).  Call once at boot when LTE time is available,
+ *        or on demand.  The boot-guard flag is reset so the send always happens.
+ */
+int uart_sensor_esl_set_ap_time(void);
+
+/** @brief Start/stop automatic ESL polling (every ESL_POLL_INTERVAL_SEC). */
+int uart_sensor_esl_poll_start(void);
+int uart_sensor_esl_poll_stop(void);
+
+/** @brief Get the number of known tags. */
+int uart_sensor_esl_get_tag_count(void);
+
+/** @brief Get info for a specific tag by ESL address. */
+int uart_sensor_esl_get_tag_info(uint16_t esl_addr, struct esl_tag_info *info);
+
+/** @brief Set the expected number of ESL tags to discover.
+ *  Scanning will repeat until this many tags are found.
+ *  Default comes from CONFIG_APP_UART_SENSOR_ESL_EXPECTED_TAGS.
+ */
+int uart_sensor_esl_set_expected_tags(int n);
+
+/** @brief Return the currently configured expected tag count. */
+int uart_sensor_esl_get_expected_tags(void);
+
+/** @brief Runtime sensor configuration — all persist to flash via MQTT commands. */
+int uart_sensor_esl_set_poll_interval(int s);
+int uart_sensor_esl_get_poll_interval(void);
+int uart_sensor_esl_set_scan_retry_interval(int s);
+int uart_sensor_esl_get_scan_retry_interval(void);
+int uart_sensor_esl_set_nus_failures(int n);
+int uart_sensor_esl_get_nus_failures(void);
+
+/**
+ * @brief Enable/disable debug echo mode.
+ *
+ * When enabled, every unrecognized UART RX line is published to MQTT
+ * as {"type":"uart_debug","line":"..."}. Disabled by default (production-safe).
+ */
+int uart_sensor_set_debug_echo(bool enable);
 
 #ifdef __cplusplus
 }

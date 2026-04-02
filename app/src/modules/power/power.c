@@ -39,7 +39,9 @@ static struct power_msg current_power_data = {
 	.voltage = 0.0,
 	.current_ma = 0.0,
 	.temperature = 0.0,
-	.timestamp = 0
+	.timestamp = 0,
+	.data_valid = false,
+	.charging = false
 };
 
 static bool module_initialized = false;
@@ -153,6 +155,8 @@ static int read_battery_level(void)
 	current_power_data.current_ma = (double)(current * 1000.0f); /* Convert A to mA */
 	current_power_data.temperature = (double)temp;
 	current_power_data.timestamp = k_uptime_get();
+	current_power_data.data_valid = true;
+	current_power_data.charging = (current > 0.0f);
 	
 	return 0;
 }
@@ -169,49 +173,36 @@ int power_sample_request(void)
 	int ret = read_battery_level();
 	if (ret < 0) {
 		LOG_ERR("Failed to read battery level: %d", ret);
-		/* Fall back to previous value or default */
-		if (current_power_data.timestamp == 0) {
-			current_power_data.percentage = 50.0; /* Default fallback */
-			current_power_data.voltage = 3.7; /* Typical Li-ion voltage */
-			current_power_data.current_ma = 0.0; /* Unknown current */
-			current_power_data.temperature = 25.0; /* Room temperature */
-			current_power_data.timestamp = k_uptime_get();
-			LOG_WRN("Using fallback battery data: %.1f%%, %.2fV", 
-				current_power_data.percentage, current_power_data.voltage);
+		current_power_data.data_valid = false;
+		current_power_data.timestamp = k_uptime_get();
+		/* Still publish so consumers know data is invalid */
+	}
+	
+	/* Validate sensor readings (only meaningful if read succeeded) */
+	if (current_power_data.data_valid) {
+		/* Validate battery percentage */
+		if (current_power_data.percentage < 0.0 || current_power_data.percentage > 100.0) {
+			LOG_WRN("Invalid battery percentage: %.1f%%, clamping to valid range",
+				current_power_data.percentage);
+			current_power_data.percentage = CLAMP(current_power_data.percentage, 0.0, 100.0);
 		}
-		return ret; /* Return error but still allow fallback data to be used */
-	}
-	
-	/* Production-quality validation of all sensor readings */
-	bool data_valid = true;
-	
-	/* Validate battery percentage */
-	if (current_power_data.percentage < 0.0 || current_power_data.percentage > 100.0) {
-		LOG_WRN("Invalid battery percentage: %.1f%%, clamping to valid range", 
-			current_power_data.percentage);
-		current_power_data.percentage = CLAMP(current_power_data.percentage, 0.0, 100.0);
-		data_valid = false;
-	}
-	
-	/* Validate voltage (reasonable range for Li-ion batteries) */
-	if (current_power_data.voltage < 2.5 || current_power_data.voltage > 4.5) {
-		LOG_WRN("Voltage out of expected range: %.3fV", current_power_data.voltage);
-		data_valid = false;
-	}
-	
-	/* Validate temperature (reasonable operating range) */
-	if (current_power_data.temperature < -20.0 || current_power_data.temperature > 60.0) {
-		LOG_WRN("Temperature out of expected range: %.1f°C", current_power_data.temperature);
-		data_valid = false;
-	}
-	
-	/* Validate current (reasonable range for typical applications) */
-	if (fabs(current_power_data.current_ma) > 1000.0) {
-		LOG_WRN("High current detected: %.1fmA", current_power_data.current_ma);
-	}
-	
-	if (data_valid) {
-		LOG_DBG("All power sensor readings validated successfully");
+
+		/* Validate voltage (reasonable range for Li-ion batteries) */
+		if (current_power_data.voltage < 2.5 || current_power_data.voltage > 4.5) {
+			LOG_WRN("Voltage out of expected range: %.3fV", current_power_data.voltage);
+			current_power_data.data_valid = false;
+		}
+
+		/* Validate temperature (reasonable operating range) */
+		if (current_power_data.temperature < -20.0 || current_power_data.temperature > 60.0) {
+			LOG_WRN("Temperature out of expected range: %.1f°C", current_power_data.temperature);
+			current_power_data.data_valid = false;
+		}
+
+		/* Validate current (reasonable range for typical applications) */
+		if (fabs(current_power_data.current_ma) > 1000.0) {
+			LOG_WRN("High current detected: %.1fmA", current_power_data.current_ma);
+		}
 	}
 	
 	/* Publish data via ZBUS for other modules */
@@ -251,13 +242,15 @@ static int power_module_init(void)
 {
 	LOG_INF("Initializing power module");
 	
-	/* Initialize with sensible default values */
+	/* Initialize with invalid defaults — real data arrives after first sample */
 	current_power_data.type = POWER_BATTERY_PERCENTAGE_SAMPLE_RESPONSE;
-	current_power_data.percentage = 50.0; /* Default until first reading */
-	current_power_data.voltage = 3.7; /* Typical Li-ion voltage */
-	current_power_data.current_ma = 0.0; /* Unknown current */
-	current_power_data.temperature = 25.0; /* Room temperature default */
-	current_power_data.timestamp = k_uptime_get();
+	current_power_data.percentage = 0.0;
+	current_power_data.voltage = 0.0;
+	current_power_data.current_ma = 0.0;
+	current_power_data.temperature = 0.0;
+	current_power_data.timestamp = 0;
+	current_power_data.data_valid = false;
+	current_power_data.charging = false;
 	
 	module_initialized = true;
 	

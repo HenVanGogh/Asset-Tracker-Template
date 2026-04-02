@@ -316,10 +316,11 @@ static void sensor_and_poll_triggers_send(void)
 		.type = CUSTOM_MQTT_EVT_DATA_SEND
 	};
 
-	err = zbus_chan_pub(&CUSTOM_MQTT_CHAN, &mqtt_msg, K_NO_WAIT);
+	/* Give the MQTT thread time to release the channel.
+	 * On timeout this is non-fatal — the next heartbeat/timer will retry. */
+	err = zbus_chan_pub(&CUSTOM_MQTT_CHAN, &mqtt_msg, K_SECONDS(2));
 	if (err) {
-		LOG_ERR("zbus_chan_pub MQTT trigger, error: %d", err);
-		SEND_FATAL_ERROR();
+		LOG_WRN("zbus_chan_pub MQTT trigger busy, will retry next cycle: %d", err);
 		return;
 	}
 #endif
@@ -457,9 +458,9 @@ static void idle_entry(void *o)
 		.red = 255,
 		.green = 255,
 		.blue = 0,
-		.duration_on_msec = 250,
+		.duration_on_msec = 50,
 		.duration_off_msec = 2000,
-		.repetitions = 10,
+		.repetitions = 3,
 	};
 
 	err = zbus_chan_pub(&LED_CHAN, &led_msg, K_SECONDS(1));
@@ -505,12 +506,17 @@ static void idle_run(void *o)
 static void triggering_entry(void *o)
 {
 	int err;
-
-	ARG_UNUSED(o);
+	const struct main_state *state_object = (const struct main_state *)o;
 
 	LOG_DBG("%s", __func__);
 
-	err = k_work_reschedule(&trigger_work, K_NO_WAIT);
+	/* Schedule a fallback trigger in case wait_for_trigger_entry is not reached.
+	 * Normal flow: SMF auto-descends to STATE_SAMPLE_DATA immediately, which calls
+	 * sensor_and_poll_triggers_send() directly — wait_for_trigger_entry then cancels
+	 * this work and reschedules at the correct interval.
+	 * Using K_NO_WAIT here caused a duplicate power publish at boot because both the
+	 * auto-descent and the trigger_work fired sensor_and_poll_triggers_send(). */
+	err = k_work_reschedule(&trigger_work, K_SECONDS(state_object->interval_sec));
 	if (err < 0) {
 		LOG_ERR("k_work_reschedule, error: %d", err);
 		SEND_FATAL_ERROR();
@@ -565,7 +571,7 @@ static void triggering_run(void *o)
 		if (msg->type == CUSTOM_MQTT_EVT_DATA_RECEIVED) {
 			/* For custom MQTT, we can handle received configuration data here */
 			/* For now, just continue with default interval */
-			LOG_INF("MQTT data received, continuing with default interval");
+			LOG_DBG("MQTT data received, continuing with default interval");
 		}
 	}
 #endif
@@ -590,9 +596,9 @@ static void sample_data_entry(void *o)
 		.red = 0,
 		.green = 55,
 		.blue = 0,
-		.duration_on_msec = 250,
+		.duration_on_msec = 50,
 		.duration_off_msec = 2000,
-		.repetitions = 10,
+		.repetitions = 3,
 	};
 
 	err = zbus_chan_pub(&LED_CHAN, &led_msg, K_SECONDS(1));
@@ -608,7 +614,7 @@ static void sample_data_entry(void *o)
 
 #if defined(CONFIG_APP_LOCATION)
 	/* Temporarily disable automatic location requests to debug heap issues */
-	LOG_INF("Location module available but automatic requests disabled for debugging");
+	LOG_DBG("Location module available but automatic requests disabled for debugging");
 	/* Continue to sensor data collection without location trigger */
 	sensor_and_poll_triggers_send();
 	smf_set_state(SMF_CTX(state_object), &states[STATE_WAIT_FOR_TRIGGER]);
@@ -623,7 +629,7 @@ static void sample_data_entry(void *o)
 	*/
 #else
 	/* If location is disabled, immediately trigger sensor data collection and continue */
-	LOG_INF("Location module disabled, proceeding directly to sensor data collection");
+	LOG_DBG("Location module disabled, proceeding directly to sensor data collection");
 	sensor_and_poll_triggers_send();
 	smf_set_state(SMF_CTX(state_object), &states[STATE_WAIT_FOR_TRIGGER]);
 #endif
@@ -691,9 +697,9 @@ static void wait_for_trigger_entry(void *o)
 		.red = 0,
 		.green = 0,
 		.blue = 55,
-		.duration_on_msec = 250,
+		.duration_on_msec = 50,
 		.duration_off_msec = 2000,
-		.repetitions = 10,
+		.repetitions = 3,
 	};
 
 	err = zbus_chan_pub(&LED_CHAN, &led_msg, K_SECONDS(1));
@@ -709,18 +715,35 @@ static void wait_for_trigger_entry(void *o)
 
 static void wait_for_trigger_run(void *o)
 {
-	const struct main_state *state_object = (const struct main_state *)o;
+	struct main_state *state_object = (struct main_state *)o;
 
 	if (state_object->chan == &TIMER_CHAN) {
+		/* Check if this is an interval-change notification (non-zero value)
+		 * versus a normal timer trigger (value == 0).
+		 */
+		int timer_val = *(const int *)state_object->msg_buf;
+
+		if (timer_val > 0) {
+			/* Power mode changed — update interval and reschedule, don't sample */
+			state_object->interval_sec = (uint32_t)timer_val;
+			LOG_WRN("Trigger interval updated to %d seconds (power mode change)",
+				state_object->interval_sec);
+			(void)k_work_cancel_delayable(&trigger_work);
+			int err = k_work_reschedule(&trigger_work,
+						    K_SECONDS(state_object->interval_sec));
+			if (err < 0) {
+				LOG_ERR("k_work_reschedule, error: %d", err);
+				SEND_FATAL_ERROR();
+			}
+			return;
+		}
+
 		LOG_DBG("Timer trigger received");
 		smf_set_state(SMF_CTX(state_object), &states[STATE_SAMPLE_DATA]);
 		return;
 	}
 
-	if (state_object->chan == &BUTTON_CHAN) {
-		smf_set_state(SMF_CTX(state_object), &states[STATE_SAMPLE_DATA]);
-		return;
-	}
+	/* Button is handled directly by custom_mqtt.c — do not advance state machine here */
 }
 
 static void wait_for_trigger_exit(void *o)

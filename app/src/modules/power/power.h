@@ -50,6 +50,12 @@ struct power_msg {
 
 	/** Timestamp of the sample in milliseconds since epoch. */
 	int64_t timestamp;
+
+	/** True if the sensor data is valid (fuel gauge read succeeded). */
+	bool data_valid;
+
+	/** True if the battery is currently charging. */
+	bool charging;
 };
 
 #define MSG_TO_POWER_MSG(_msg)	(*(const struct power_msg *)_msg)

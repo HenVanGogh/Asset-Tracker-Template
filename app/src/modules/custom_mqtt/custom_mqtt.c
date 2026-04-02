@@ -13,10 +13,13 @@
 #include <zephyr/net/hostname.h>
 #include <zephyr/data/json.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/reboot.h>
+#include <zephyr/settings/settings.h>
 #include <cJSON.h>
 #include <date_time.h>
 #include <arpa/inet.h>
 #include <math.h>
+#include <zephyr/app_version.h>
 
 #include "custom_mqtt.h"
 #include "custom_mqtt_config.h"
@@ -48,15 +51,50 @@
 /* Register log module */
 LOG_MODULE_REGISTER(custom_mqtt, CONFIG_APP_CUSTOM_MQTT_LOG_LEVEL);
 
-/* MQTT client configuration */
-#define MQTT_BROKER_HOSTNAME CONFIG_APP_CUSTOM_MQTT_BROKER_HOSTNAME
-#define MQTT_BROKER_PORT CONFIG_APP_CUSTOM_MQTT_BROKER_PORT
-#define MQTT_CLIENT_ID "thingy91x-asset-tracker"
-#define MQTT_USERNAME CONFIG_APP_CUSTOM_MQTT_USERNAME
-#define MQTT_PASSWORD CONFIG_APP_CUSTOM_MQTT_PASSWORD
-#define MQTT_PUB_TOPIC CONFIG_APP_CUSTOM_MQTT_PUBLISH_TOPIC
-#define MQTT_SUB_TOPIC CONFIG_APP_CUSTOM_MQTT_SUBSCRIBE_TOPIC
-#define MQTT_KEEPALIVE CONFIG_APP_CUSTOM_MQTT_KEEPALIVE_SECONDS
+/* MQTT client configuration — compile-time defaults used to init runtime config */
+#define MQTT_BROKER_HOSTNAME_DEFAULT CONFIG_APP_CUSTOM_MQTT_BROKER_HOSTNAME
+#define MQTT_BROKER_PORT_DEFAULT     CONFIG_APP_CUSTOM_MQTT_BROKER_PORT
+#define MQTT_CLIENT_ID_DEFAULT       CONFIG_APP_CUSTOM_MQTT_DEVICE_ID
+#define MQTT_USERNAME_DEFAULT        CONFIG_APP_CUSTOM_MQTT_USERNAME
+#define MQTT_PASSWORD_DEFAULT        CONFIG_APP_CUSTOM_MQTT_PASSWORD
+#define MQTT_PUB_TOPIC_DEFAULT       CONFIG_APP_CUSTOM_MQTT_PUBLISH_TOPIC
+#define MQTT_SUB_TOPIC_DEFAULT       CONFIG_APP_CUSTOM_MQTT_SUBSCRIBE_TOPIC
+#define MQTT_KEEPALIVE               CONFIG_APP_CUSTOM_MQTT_KEEPALIVE_SECONDS
+
+/* Power mode enum — runtime switchable, persisted in settings */
+enum power_mode {
+	POWER_MODE_NORMAL = 0,
+	POWER_MODE_HIGH   = 1,
+};
+
+/* Runtime-configurable MQTT parameters (loaded from flash on boot, saved on change) */
+#define MQTT_RT_HOST_MAX  128
+#define MQTT_RT_STR_MAX    64
+
+static struct {
+	char host[MQTT_RT_HOST_MAX];
+	uint16_t port;
+	char username[MQTT_RT_STR_MAX];
+	char password[MQTT_RT_STR_MAX];
+	char client_id[MQTT_RT_STR_MAX];
+	char pub_topic[MQTT_RT_TOPIC_MAX];
+	char sub_topic[MQTT_RT_TOPIC_MAX];
+	bool tls_enabled;
+	uint32_t sec_tag;
+	enum power_mode power_mode;
+} mqtt_rt_cfg;
+
+/* Security tag — always compiled in, used when tls_enabled is true at runtime */
+static sec_tag_t rt_sec_tag_list[1];
+
+/* Convenience aliases — all broker/auth/id access goes through mqtt_rt_cfg */
+#define MQTT_BROKER_HOSTNAME mqtt_rt_cfg.host
+#define MQTT_BROKER_PORT     mqtt_rt_cfg.port
+#define MQTT_USERNAME        mqtt_rt_cfg.username
+#define MQTT_PASSWORD        mqtt_rt_cfg.password
+#define MQTT_CLIENT_ID       mqtt_rt_cfg.client_id
+#define MQTT_PUB_TOPIC       mqtt_rt_cfg.pub_topic
+#define MQTT_SUB_TOPIC       mqtt_rt_cfg.sub_topic
 
 /* Buffer sizes */
 #define MQTT_RX_BUF_SIZE 512
@@ -97,13 +135,141 @@ static struct {
 /* State machine context */
 static struct smf_ctx sm_ctx;
 
-/* MQTT client buffers */
-static uint8_t mqtt_client_id[] = MQTT_CLIENT_ID;
+/* MQTT restart work — disconnects + reconnects asynchronously */
+static struct k_work_delayable mqtt_restart_work;
+static void mqtt_restart_work_fn(struct k_work *work);
+static void mqtt_inactivity_work_fn(struct k_work *work);
 
-/* Security tag for TLS */
+/* Reconnect delay (module-level so it resets properly between error episodes) */
+static uint32_t mqtt_reconnect_delay_sec = MQTT_RECONNECT_BASE_DELAY_SEC;
+
+/* Inactivity watchdog — reboots if no MQTT activity for MQTT_INACTIVITY_WATCHDOG_SEC */
+static struct k_work_delayable mqtt_inactivity_work;
+static int64_t last_mqtt_activity_ms;    /* k_uptime_get() of last MQTT I/O */
+static bool mqtt_inactive_reboot_flag;   /* set before reboot, cleared after reporting */
+
+/* ---- Zephyr Settings handlers ---- */
+
+/* MQTT config settings: app/mqtt/{host,port,user,pass,client_id} */
+static int app_mqtt_settings_set(const char *key, size_t len,
+				  settings_read_cb read_cb, void *cb_arg)
+{
+	int rc;
+
+	if (strcmp(key, "host") == 0) {
+		rc = read_cb(cb_arg, mqtt_rt_cfg.host, sizeof(mqtt_rt_cfg.host) - 1);
+		if (rc >= 0) {
+			mqtt_rt_cfg.host[rc] = '\0';
+		}
+	} else if (strcmp(key, "port") == 0) {
+		uint16_t v;
+		if (read_cb(cb_arg, &v, sizeof(v)) == sizeof(v)) {
+			mqtt_rt_cfg.port = v;
+		}
+	} else if (strcmp(key, "user") == 0) {
+		rc = read_cb(cb_arg, mqtt_rt_cfg.username, sizeof(mqtt_rt_cfg.username) - 1);
+		if (rc >= 0) {
+			mqtt_rt_cfg.username[rc] = '\0';
+		}
+	} else if (strcmp(key, "pass") == 0) {
+		rc = read_cb(cb_arg, mqtt_rt_cfg.password, sizeof(mqtt_rt_cfg.password) - 1);
+		if (rc >= 0) {
+			mqtt_rt_cfg.password[rc] = '\0';
+		}
+	} else if (strcmp(key, "client_id") == 0) {
+		rc = read_cb(cb_arg, mqtt_rt_cfg.client_id, sizeof(mqtt_rt_cfg.client_id) - 1);
+		if (rc >= 0) {
+			mqtt_rt_cfg.client_id[rc] = '\0';
+		}
+	} else if (strcmp(key, "pub_topic") == 0) {
+		rc = read_cb(cb_arg, mqtt_rt_cfg.pub_topic, sizeof(mqtt_rt_cfg.pub_topic) - 1);
+		if (rc >= 0) {
+			mqtt_rt_cfg.pub_topic[rc] = '\0';
+		}
+	} else if (strcmp(key, "sub_topic") == 0) {
+		rc = read_cb(cb_arg, mqtt_rt_cfg.sub_topic, sizeof(mqtt_rt_cfg.sub_topic) - 1);
+		if (rc >= 0) {
+			mqtt_rt_cfg.sub_topic[rc] = '\0';
+		}
+	} else if (strcmp(key, "tls") == 0) {
+		uint8_t v;
+		if (read_cb(cb_arg, &v, sizeof(v)) == sizeof(v)) {
+			mqtt_rt_cfg.tls_enabled = (v != 0);
+		}
+	} else if (strcmp(key, "sec_tag") == 0) {
+		uint32_t v;
+		if (read_cb(cb_arg, &v, sizeof(v)) == (ssize_t)sizeof(v)) {
+			mqtt_rt_cfg.sec_tag = v;
+		}
+	} else if (strcmp(key, "power_mode") == 0) {
+		uint8_t v;
+		if (read_cb(cb_arg, &v, sizeof(v)) == sizeof(v)) {
+			mqtt_rt_cfg.power_mode = (v == 1) ? POWER_MODE_HIGH : POWER_MODE_NORMAL;
+		}
+	}
+	return 0;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(app_mqtt_stg, "app/mqtt", NULL,
+				app_mqtt_settings_set, NULL, NULL);
+
+/* Sensor config settings: app/sensor/{poll,scan_retry,expected,nus_fail} */
+static int app_sensor_settings_set(const char *key, size_t len,
+				    settings_read_cb read_cb, void *cb_arg)
+{
+#if defined(CONFIG_APP_UART_SENSOR)
+	uint32_t v32;
+	uint8_t v8;
+
+	if (strcmp(key, "poll") == 0) {
+		if (read_cb(cb_arg, &v32, sizeof(v32)) == (ssize_t)sizeof(v32)) {
+			uart_sensor_esl_set_poll_interval((int)v32);
+		}
+	} else if (strcmp(key, "scan_retry") == 0) {
+		if (read_cb(cb_arg, &v32, sizeof(v32)) == (ssize_t)sizeof(v32)) {
+			uart_sensor_esl_set_scan_retry_interval((int)v32);
+		}
+	} else if (strcmp(key, "expected") == 0) {
+		if (read_cb(cb_arg, &v8, sizeof(v8)) == (ssize_t)sizeof(v8)) {
+			/* Set directly — don't call esl_discovery_check yet (module may not be
+			 * initialized). uart_sensor_esl_set_expected_tags() guards this. */
+			uart_sensor_esl_set_expected_tags((int)v8);
+		}
+	} else if (strcmp(key, "nus_fail") == 0) {
+		if (read_cb(cb_arg, &v8, sizeof(v8)) == (ssize_t)sizeof(v8)) {
+			uart_sensor_esl_set_nus_failures((int)v8);
+		}
+	}
+#endif
+	return 0;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(app_sensor_stg, "app/sensor", NULL,
+				app_sensor_settings_set, NULL, NULL);
+
+/* Watchdog settings: app/watchdog/mqtt_inactive */
+static int app_watchdog_settings_set(const char *key, size_t len,
+				      settings_read_cb read_cb, void *cb_arg)
+{
+	if (strcmp(key, "mqtt_inactive") == 0) {
+		uint8_t v = 0;
+		if (read_cb(cb_arg, &v, sizeof(v)) == (ssize_t)sizeof(v)) {
+			mqtt_inactive_reboot_flag = (v != 0);
+		}
+	}
+	return 0;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(app_watchdog_stg, "app/watchdog", NULL,
+				app_watchdog_settings_set, NULL, NULL);
+
+/* Security tag for TLS — compile-time default, overridden by runtime config */
 #if defined(CONFIG_APP_CUSTOM_MQTT_USE_TLS)
 static sec_tag_t sec_tag_list[] = { CONFIG_APP_CUSTOM_MQTT_SEC_TAG };
 #endif
+
+/* Declare external ZBUS channels defined in other modules */
+ZBUS_CHAN_DECLARE(TIMER_CHAN);
 
 /* Register zbus subscriber */
 ZBUS_MSG_SUBSCRIBER_DEFINE(custom_mqtt_subscriber);
@@ -143,7 +309,6 @@ static int mqtt_publish_data(const char *data, size_t len);
 
 /* Data validation helpers */
 static bool validate_sensor_data(double value, double min, double max);
-static bool validate_json_string(const char *json_str);
 static int safe_publish_json(cJSON *json, const char *data_type);
 
 /* Location trigger functionality */
@@ -164,6 +329,7 @@ static void process_power_data(const struct power_msg *msg);
 #endif
 #if defined(CONFIG_APP_UART_SENSOR)
 static void process_uart_sensor_data(const struct uart_sensor_msg *msg);
+static bool uart_debug_echo_active; /* Runtime toggle: publish raw UART RX to MQTT */
 #endif
 #if defined(CONFIG_APP_BUTTON)
 static void process_button_msg(const struct button_msg *msg);
@@ -199,6 +365,7 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 	case MQTT_EVT_CONNACK:
 		if (evt->result == 0) {
 			LOG_INF("MQTT client connected");
+			last_mqtt_activity_ms = k_uptime_get();
 			mqtt_ctx.state = MQTT_STATE_CONNECTED;
 			msg.type = CUSTOM_MQTT_EVT_CONNECTED;
 			zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
@@ -219,6 +386,7 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 		break;
 
 	case MQTT_EVT_PUBLISH:
+		last_mqtt_activity_ms = k_uptime_get();
 		LOG_INF(">>> MQTT_EVT_PUBLISH received! <<<");
 		LOG_INF("MQTT message received on topic: %.*s",
 			evt->param.publish.message.topic.topic.size,
@@ -275,7 +443,7 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 		
 		if (len > 0) {
 			LOG_INF("Received message (%zu bytes): %s", len, (char *)mqtt_ctx.payload_buf);
-			
+
 			/* Process command and send response */
 			cJSON *response = cJSON_CreateObject();
 			if (response) {
@@ -290,20 +458,26 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 					/* Check for "type": "uart_passthrough" format first */
 					cJSON *type = cJSON_GetObjectItem(received_json, "type");
 					cJSON *command = cJSON_GetObjectItem(received_json, "command");
+					if (!command) {
+						command = cJSON_GetObjectItem(received_json, "cmd");
+					}
 					
 					if (type && cJSON_IsString(type) && 
 					    strcmp(type->valuestring, "uart_passthrough") == 0 &&
 					    command && cJSON_IsString(command)) {
-						/* Handle uart_passthrough: forward command directly to UART */
-						/* No MQTT acknowledgment - just forward silently */
-						LOG_DBG("UART passthrough: %s", command->valuestring);
-						
-						/* Publish forward request to ZBUS */
-						msg.type = CUSTOM_MQTT_EVT_FORWARD_UART;
-						msg.forward_uart.data = command->valuestring;
-						msg.forward_uart.len = strlen(command->valuestring);
-						zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
-						
+						/* Handle uart_passthrough: validate and forward as ESL command */
+						const char *cmd = command->valuestring;
+						LOG_DBG("UART passthrough request: %s", cmd);
+
+						/* Route through uart_sensor_esl_command() which auto-prefixes esl_c */
+#if defined(CONFIG_APP_UART_SENSOR)
+						int ret = uart_sensor_esl_command(cmd);
+						if (ret != 0) {
+							LOG_WRN("Failed to send ESL command: %s (err %d)", cmd, ret);
+						}
+#else
+						LOG_WRN("UART passthrough not available — UART sensor disabled");
+#endif
 						/* Clean up and skip publishing response */
 						cJSON_Delete(received_json);
 						cJSON_Delete(response);
@@ -331,28 +505,488 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 						} else if (strcmp(command->valuestring, "uart_command") == 0) {
 							cJSON *args = cJSON_GetObjectItem(received_json, "args");
 							if (args && cJSON_IsString(args)) {
-								LOG_INF("Forwarding UART command: %s", args->valuestring);
-								
-								/* Publish forward request to ZBUS */
-								msg.type = CUSTOM_MQTT_EVT_FORWARD_UART;
-								msg.forward_uart.data = args->valuestring;
-								msg.forward_uart.len = strlen(args->valuestring);
-								zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
-								
-								cJSON_AddStringToObject(response, "status", "command_forwarded");
+								LOG_INF("UART command via MQTT: %s", args->valuestring);
+#if defined(CONFIG_APP_UART_SENSOR)
+								/* Route through esl_command() for proper esl_c prefix */
+								uart_sensor_esl_command(args->valuestring);
+								cJSON_AddStringToObject(response, "status", "esl_command_sent");
+#else
+								cJSON_AddStringToObject(response, "status", "uart_not_available");
+#endif
 							} else {
 								cJSON_AddStringToObject(response, "status", "missing_args");
 							}
+#if defined(CONFIG_APP_UART_SENSOR)
+						/* ---- ESL BLE Management Commands ---- */
+						} else if (strcmp(command->valuestring, "esl_scan") == 0) {
+							LOG_INF("ESL scan command via MQTT");
+							cJSON *action = cJSON_GetObjectItem(received_json, "action");
+							if (action && cJSON_IsString(action) &&
+							    strcmp(action->valuestring, "stop") == 0) {
+								uart_sensor_esl_scan_stop();
+								cJSON_AddStringToObject(response, "status", "esl_scan_stopped");
+							} else {
+								uart_sensor_esl_scan_start();
+								cJSON_AddStringToObject(response, "status", "esl_scan_started");
+							}
+
+						} else if (strcmp(command->valuestring, "esl_list_tags") == 0) {
+							LOG_INF("ESL list tags via MQTT");
+							int count = uart_sensor_esl_get_tag_count();
+							cJSON_AddStringToObject(response, "status", "ok");
+							cJSON_AddNumberToObject(response, "tag_count", count);
+							/* Request fresh data from AP */
+							uart_sensor_esl_command("acl list");
+
+						} else if (strcmp(command->valuestring, "esl_nus_status") == 0) {
+							cJSON *id_json = cJSON_GetObjectItem(received_json, "id");
+							if (id_json && cJSON_IsNumber(id_json)) {
+								uint16_t id = (uint16_t)id_json->valueint;
+								uart_sensor_esl_nus_status(id);
+								cJSON_AddStringToObject(response, "status", "nus_status_requested");
+								cJSON_AddNumberToObject(response, "esl_id", id);
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_id");
+							}
+
+						} else if (strcmp(command->valuestring, "esl_nus_sensors") == 0) {
+							cJSON *id_json = cJSON_GetObjectItem(received_json, "id");
+							if (id_json && cJSON_IsNumber(id_json)) {
+								uint16_t id = (uint16_t)id_json->valueint;
+								uart_sensor_esl_nus_sensors(id);
+								cJSON_AddStringToObject(response, "status", "nus_sensors_requested");
+								cJSON_AddNumberToObject(response, "esl_id", id);
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_id");
+							}
+
+						} else if (strcmp(command->valuestring, "esl_poll") == 0) {
+							cJSON *action = cJSON_GetObjectItem(received_json, "action");
+							if (action && cJSON_IsString(action) &&
+							    strcmp(action->valuestring, "stop") == 0) {
+								uart_sensor_esl_poll_stop();
+								cJSON_AddStringToObject(response, "status", "esl_poll_stopped");
+							} else {
+								uart_sensor_esl_poll_start();
+								cJSON_AddStringToObject(response, "status", "esl_poll_started");
+							}
+
+						} else if (strcmp(command->valuestring, "esl_command") == 0) {
+							cJSON *args = cJSON_GetObjectItem(received_json, "args");
+							if (args && cJSON_IsString(args)) {
+								LOG_INF("Raw ESL command: %s", args->valuestring);
+								uart_sensor_esl_command(args->valuestring);
+								cJSON_AddStringToObject(response, "status", "esl_command_sent");
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_args");
+							}
+
+						} else if (strcmp(command->valuestring, "esl_raw") == 0) {
+							/* Simpler raw ESL command: {"command":"esl_raw","cmd":"reset_ap"} */
+							cJSON *raw_cmd = cJSON_GetObjectItem(received_json, "cmd");
+							if (!raw_cmd) {
+								raw_cmd = cJSON_GetObjectItem(received_json, "args");
+							}
+							if (raw_cmd && cJSON_IsString(raw_cmd)) {
+								LOG_INF("esl_raw: forwarding '%s'", raw_cmd->valuestring);
+								uart_sensor_esl_command(raw_cmd->valuestring);
+								cJSON_AddStringToObject(response, "status", "esl_raw_sent");
+								cJSON_AddStringToObject(response, "cmd_sent", raw_cmd->valuestring);
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_cmd");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"esl_raw\",\"cmd\":\"reset_ap\"}");
+							}
+
+						} else if (strcmp(command->valuestring, "uart_debug_echo") == 0) {
+							/* Toggle UART debug echo — off by default, not for production.
+							 * When on, ALL unrecognized UART RX lines are published to MQTT
+							 * as {"type":"uart_debug","line":"..."}. */
+							cJSON *action = cJSON_GetObjectItem(received_json, "action");
+							bool enable = true;
+							if (action && cJSON_IsString(action) &&
+							    strcmp(action->valuestring, "stop") == 0) {
+								enable = false;
+							}
+							uart_debug_echo_active = enable;
+							uart_sensor_set_debug_echo(enable);
+							LOG_INF("UART debug echo %s via MQTT",
+								enable ? "ENABLED" : "disabled");
+							cJSON_AddStringToObject(response, "status",
+								enable ? "uart_debug_echo_enabled"
+								       : "uart_debug_echo_disabled");
+							cJSON_AddBoolToObject(response, "uart_debug_echo_active", enable);
+
+						} else if (strcmp(command->valuestring, "esl_status") == 0) {
+							LOG_INF("ESL AP status via MQTT");
+							cJSON_AddStringToObject(response, "status", "ok");
+							cJSON_AddNumberToObject(response, "tag_count",
+								uart_sensor_esl_get_tag_count());
+							cJSON_AddNumberToObject(response, "uptime_ms", k_uptime_get());
+							/* Also ask the AP for its status */
+							uart_sensor_esl_command("acl list");
+
+						} else if (strcmp(command->valuestring, "esl_nus_reset") == 0) {
+							cJSON *id_json = cJSON_GetObjectItem(received_json, "id");
+							if (id_json && cJSON_IsNumber(id_json)) {
+								char cmd[32];
+								snprintf(cmd, sizeof(cmd), "nus reset %d", id_json->valueint);
+								uart_sensor_esl_command(cmd);
+								cJSON_AddStringToObject(response, "status", "nus_reset_sent");
+								cJSON_AddNumberToObject(response, "esl_id", id_json->valueint);
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_id");
+							}
+
+						} else if (strcmp(command->valuestring, "esl_nus_led") == 0) {
+							cJSON *id_json = cJSON_GetObjectItem(received_json, "id");
+							if (id_json && cJSON_IsNumber(id_json)) {
+								char cmd[32];
+								snprintf(cmd, sizeof(cmd), "nus led %d", id_json->valueint);
+								uart_sensor_esl_command(cmd);
+								cJSON_AddStringToObject(response, "status", "nus_led_sent");
+								cJSON_AddNumberToObject(response, "esl_id", id_json->valueint);
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_id");
+							}
+
+						} else if (strcmp(command->valuestring, "esl_get_tags") == 0) {
+							LOG_INF("ESL get tags info via MQTT");
+							int tc = uart_sensor_esl_get_tag_count();
+							cJSON_AddStringToObject(response, "status", "ok");
+							cJSON_AddNumberToObject(response, "tag_count", tc);
+							cJSON *tags_arr = cJSON_AddArrayToObject(response, "tags");
+							if (tags_arr) {
+								for (int ti = 0; ti < tc; ti++) {
+									struct esl_tag_info tinfo;
+									if (uart_sensor_esl_get_tag_info((uint16_t)ti, &tinfo) == 0) {
+										cJSON *t = cJSON_CreateObject();
+										if (t) {
+											char eid[16];
+											snprintf(eid, sizeof(eid), "ESL_0x%04X", tinfo.esl_addr);
+											cJSON_AddStringToObject(t, "esl_id", eid);
+											cJSON_AddStringToObject(t, "mac", tinfo.mac);
+											cJSON_AddNumberToObject(t, "battery_mv", tinfo.battery_mv);
+											cJSON_AddNumberToObject(t, "uptime_s", tinfo.uptime_s);
+											cJSON_AddNumberToObject(t, "temperature", tinfo.temperature);
+											cJSON_AddNumberToObject(t, "flags", tinfo.flags);
+											cJSON_AddBoolToObject(t, "connected", tinfo.connected);
+											cJSON_AddItemToArray(tags_arr, t);
+										}
+									}
+								}
+							}
+
+						} else if (strcmp(command->valuestring, "esl_set_expected_tags") == 0) {
+							cJSON *cnt = cJSON_GetObjectItem(received_json, "count");
+							if (cnt && cJSON_IsNumber(cnt)) {
+								int ret = uart_sensor_esl_set_expected_tags(cnt->valueint);
+								if (ret == 0) {
+									cJSON_AddStringToObject(response, "status", "ok");
+									cJSON_AddNumberToObject(response, "expected_tags", cnt->valueint);
+									uint8_t v8 = (uint8_t)cnt->valueint;
+									settings_save_one("app/sensor/expected", &v8, sizeof(v8));
+									LOG_INF("Expected ESL tags set to %d via MQTT", cnt->valueint);
+								} else {
+									cJSON_AddStringToObject(response, "status", "invalid_count");
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_count");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"esl_set_expected_tags\",\"count\":2}");
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_get_config") == 0) {
+							cJSON_AddStringToObject(response, "status", "ok");
+							cJSON_AddNumberToObject(response, "poll_interval_s",
+								uart_sensor_esl_get_poll_interval());
+							cJSON_AddNumberToObject(response, "scan_retry_interval_s",
+								uart_sensor_esl_get_scan_retry_interval());
+							cJSON_AddNumberToObject(response, "expected_tags",
+								uart_sensor_esl_get_expected_tags());
+							cJSON_AddNumberToObject(response, "nus_max_failures",
+								uart_sensor_esl_get_nus_failures());
+
+						} else if (strcmp(command->valuestring, "sensor_set_poll_interval") == 0) {
+							cJSON *v = cJSON_GetObjectItem(received_json, "interval_s");
+							if (v && cJSON_IsNumber(v)) {
+								int ret = uart_sensor_esl_set_poll_interval(v->valueint);
+								if (ret == 0) {
+									uint32_t val = (uint32_t)v->valueint;
+									settings_save_one("app/sensor/poll", &val, sizeof(val));
+									cJSON_AddStringToObject(response, "status", "ok");
+									cJSON_AddNumberToObject(response, "poll_interval_s", v->valueint);
+								} else {
+									cJSON_AddStringToObject(response, "status", "invalid_value");
+									cJSON_AddStringToObject(response, "hint", "Range: 10-86400 s");
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_interval_s");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"sensor_set_poll_interval\",\"interval_s\":600}");
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_set_scan_retry_interval") == 0) {
+							cJSON *v = cJSON_GetObjectItem(received_json, "interval_s");
+							if (v && cJSON_IsNumber(v)) {
+								int ret = uart_sensor_esl_set_scan_retry_interval(v->valueint);
+								if (ret == 0) {
+									uint32_t val = (uint32_t)v->valueint;
+									settings_save_one("app/sensor/scan_retry", &val, sizeof(val));
+									cJSON_AddStringToObject(response, "status", "ok");
+									cJSON_AddNumberToObject(response, "scan_retry_interval_s", v->valueint);
+								} else {
+									cJSON_AddStringToObject(response, "status", "invalid_value");
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_interval_s");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"sensor_set_scan_retry_interval\",\"interval_s\":60}");
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_set_nus_failures") == 0) {
+							cJSON *v = cJSON_GetObjectItem(received_json, "count");
+							if (v && cJSON_IsNumber(v)) {
+								int ret = uart_sensor_esl_set_nus_failures(v->valueint);
+								if (ret == 0) {
+									uint8_t val = (uint8_t)v->valueint;
+									settings_save_one("app/sensor/nus_fail", &val, sizeof(val));
+									cJSON_AddStringToObject(response, "status", "ok");
+									cJSON_AddNumberToObject(response, "nus_max_failures", v->valueint);
+								} else {
+									cJSON_AddStringToObject(response, "status", "invalid_value");
+									cJSON_AddStringToObject(response, "hint", "Range: 1-20");
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_count");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"sensor_set_nus_failures\",\"count\":3}");
+							}
+
+						} else if (strcmp(command->valuestring, "esl_get_name") == 0) {
+							/* Request human-readable name from one or all ESL tags.
+							 * Optional "esl_id": numeric ESL address (decimal).
+							 * Omit or set to 65535 to query all known tags.
+							 * Response arrives as sensor_name MQTT message. */
+							cJSON *id_j = cJSON_GetObjectItem(received_json, "esl_id");
+							uint16_t target = 0xFFFF; /* default: all */
+							if (id_j && cJSON_IsNumber(id_j)) {
+								target = (uint16_t)id_j->valueint;
+							}
+							int ret = uart_sensor_esl_get_name(target);
+							if (ret == 0) {
+								cJSON_AddStringToObject(response, "status", "get_name_sent");
+								if (target == 0xFFFF) {
+									cJSON_AddStringToObject(response, "target", "all");
+								} else {
+									cJSON_AddNumberToObject(response, "esl_id", target);
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddNumberToObject(response, "error_code", ret);
+							}
+
+						} else if (strcmp(command->valuestring, "ap_set_time") == 0) {
+							/* Force-push current LTE UTC time to the nRF5340 AP.
+							 * Normally happens automatically on boot; use this to
+							 * re-sync after an AP reboot or manual override. */
+							int ret = uart_sensor_esl_set_ap_time();
+							if (ret == 0) {
+								cJSON_AddStringToObject(response, "status", "ap_set_time_sent");
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddStringToObject(response, "hint",
+									"LTE time may not be available yet");
+								cJSON_AddNumberToObject(response, "error_code", ret);
+							}
+
+#endif /* CONFIG_APP_UART_SENSOR */
+
+						} else if (strcmp(command->valuestring, "mqtt_get_config") == 0) {
+							cJSON_AddStringToObject(response, "status", "ok");
+							cJSON_AddStringToObject(response, "host", mqtt_rt_cfg.host);
+							cJSON_AddNumberToObject(response, "port", mqtt_rt_cfg.port);
+							cJSON_AddStringToObject(response, "username", mqtt_rt_cfg.username);
+							cJSON_AddStringToObject(response, "client_id", mqtt_rt_cfg.client_id);
+							/* password intentionally omitted */
+							cJSON_AddStringToObject(response, "pub_topic", mqtt_rt_cfg.pub_topic);
+							cJSON_AddStringToObject(response, "sub_topic", mqtt_rt_cfg.sub_topic);
+							cJSON_AddBoolToObject(response, "tls_enabled", mqtt_rt_cfg.tls_enabled);
+							cJSON_AddNumberToObject(response, "sec_tag", mqtt_rt_cfg.sec_tag);
+							cJSON_AddStringToObject(response, "power_mode",
+								mqtt_rt_cfg.power_mode == POWER_MODE_HIGH ? "high" : "normal");
+							cJSON_AddStringToObject(response, "version", APP_VERSION_STRING);
+
+						} else if (strcmp(command->valuestring, "mqtt_set_broker") == 0) {
+							cJSON *host_j = cJSON_GetObjectItem(received_json, "host");
+							cJSON *port_j = cJSON_GetObjectItem(received_json, "port");
+							bool changed = false;
+							if (host_j && cJSON_IsString(host_j) && strlen(host_j->valuestring) > 0) {
+								strncpy(mqtt_rt_cfg.host, host_j->valuestring,
+									sizeof(mqtt_rt_cfg.host) - 1);
+								settings_save_one("app/mqtt/host", mqtt_rt_cfg.host,
+										  strlen(mqtt_rt_cfg.host));
+								changed = true;
+							}
+							if (port_j && cJSON_IsNumber(port_j)) {
+								mqtt_rt_cfg.port = (uint16_t)port_j->valueint;
+								settings_save_one("app/mqtt/port", &mqtt_rt_cfg.port,
+										  sizeof(mqtt_rt_cfg.port));
+								changed = true;
+							}
+							if (changed) {
+								cJSON_AddStringToObject(response, "status", "saved");
+								cJSON_AddStringToObject(response, "host", mqtt_rt_cfg.host);
+								cJSON_AddNumberToObject(response, "port", mqtt_rt_cfg.port);
+								cJSON_AddStringToObject(response, "note",
+									"Send mqtt_restart to reconnect with new broker");
+							} else {
+								cJSON_AddStringToObject(response, "status", "no_changes");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"mqtt_set_broker\",\"host\":\"192.168.1.1\",\"port\":1883}");
+							}
+
+						} else if (strcmp(command->valuestring, "mqtt_set_auth") == 0) {
+							cJSON *user_j = cJSON_GetObjectItem(received_json, "username");
+							cJSON *pass_j = cJSON_GetObjectItem(received_json, "password");
+							bool changed = false;
+							if (user_j && cJSON_IsString(user_j)) {
+								strncpy(mqtt_rt_cfg.username, user_j->valuestring,
+									sizeof(mqtt_rt_cfg.username) - 1);
+								settings_save_one("app/mqtt/user", mqtt_rt_cfg.username,
+										  strlen(mqtt_rt_cfg.username));
+								changed = true;
+							}
+							if (pass_j && cJSON_IsString(pass_j)) {
+								strncpy(mqtt_rt_cfg.password, pass_j->valuestring,
+									sizeof(mqtt_rt_cfg.password) - 1);
+								settings_save_one("app/mqtt/pass", mqtt_rt_cfg.password,
+										  strlen(mqtt_rt_cfg.password));
+								changed = true;
+							}
+							if (changed) {
+								cJSON_AddStringToObject(response, "status", "saved");
+								cJSON_AddStringToObject(response, "note",
+									"Send mqtt_restart to reconnect with new credentials");
+							} else {
+								cJSON_AddStringToObject(response, "status", "no_changes");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"mqtt_set_auth\",\"username\":\"user\",\"password\":\"pass\"}");
+							}
+
+						} else if (strcmp(command->valuestring, "mqtt_set_client_id") == 0) {
+							cJSON *id_j = cJSON_GetObjectItem(received_json, "id");
+							if (id_j && cJSON_IsString(id_j) && strlen(id_j->valuestring) > 0) {
+								strncpy(mqtt_rt_cfg.client_id, id_j->valuestring,
+									sizeof(mqtt_rt_cfg.client_id) - 1);
+								settings_save_one("app/mqtt/client_id", mqtt_rt_cfg.client_id,
+										  strlen(mqtt_rt_cfg.client_id));
+								cJSON_AddStringToObject(response, "status", "saved");
+								cJSON_AddStringToObject(response, "client_id", mqtt_rt_cfg.client_id);
+								cJSON_AddStringToObject(response, "note",
+									"Send mqtt_restart to reconnect with new client ID");
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_id");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"mqtt_set_client_id\",\"id\":\"my_device\"}");
+							}
+
+						} else if (strcmp(command->valuestring, "mqtt_restart") == 0) {
+							cJSON_AddStringToObject(response, "status", "restarting");
+							cJSON_AddStringToObject(response, "host", mqtt_rt_cfg.host);
+							cJSON_AddNumberToObject(response, "port", mqtt_rt_cfg.port);
+							/* Disconnect + reconnect after 2 s (gives time for response to send) */
+							k_work_reschedule(&mqtt_restart_work, K_SECONDS(2));
+
+						} else if (strcmp(command->valuestring, "mqtt_set_topics") == 0) {
+							cJSON *pub_j = cJSON_GetObjectItem(received_json, "pub_topic");
+							cJSON *sub_j = cJSON_GetObjectItem(received_json, "sub_topic");
+							bool changed = false;
+							if (pub_j && cJSON_IsString(pub_j) && strlen(pub_j->valuestring) > 0) {
+								strncpy(mqtt_rt_cfg.pub_topic, pub_j->valuestring,
+									sizeof(mqtt_rt_cfg.pub_topic) - 1);
+								settings_save_one("app/mqtt/pub_topic", mqtt_rt_cfg.pub_topic,
+										  strlen(mqtt_rt_cfg.pub_topic));
+								changed = true;
+							}
+							if (sub_j && cJSON_IsString(sub_j) && strlen(sub_j->valuestring) > 0) {
+								strncpy(mqtt_rt_cfg.sub_topic, sub_j->valuestring,
+									sizeof(mqtt_rt_cfg.sub_topic) - 1);
+								settings_save_one("app/mqtt/sub_topic", mqtt_rt_cfg.sub_topic,
+										  strlen(mqtt_rt_cfg.sub_topic));
+								changed = true;
+							}
+							if (changed) {
+								cJSON_AddStringToObject(response, "status", "saved");
+								cJSON_AddStringToObject(response, "pub_topic", mqtt_rt_cfg.pub_topic);
+								cJSON_AddStringToObject(response, "sub_topic", mqtt_rt_cfg.sub_topic);
+								cJSON_AddStringToObject(response, "note",
+									"Send mqtt_restart to reconnect with new topics");
+							} else {
+								cJSON_AddStringToObject(response, "status", "no_changes");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"mqtt_set_topics\",\"pub_topic\":\"gw/dev1/data\",\"sub_topic\":\"gw/dev1/cmd\"}");
+							}
+
+						} else if (strcmp(command->valuestring, "mqtt_set_tls") == 0) {
+							cJSON *en_j = cJSON_GetObjectItem(received_json, "enabled");
+							cJSON *tag_j = cJSON_GetObjectItem(received_json, "sec_tag");
+							if (en_j && cJSON_IsBool(en_j)) {
+								mqtt_rt_cfg.tls_enabled = cJSON_IsTrue(en_j);
+								uint8_t v = mqtt_rt_cfg.tls_enabled ? 1 : 0;
+								settings_save_one("app/mqtt/tls", &v, sizeof(v));
+							}
+							if (tag_j && cJSON_IsNumber(tag_j)) {
+								mqtt_rt_cfg.sec_tag = (uint32_t)tag_j->valueint;
+								settings_save_one("app/mqtt/sec_tag", &mqtt_rt_cfg.sec_tag,
+										  sizeof(mqtt_rt_cfg.sec_tag));
+							}
+							cJSON_AddStringToObject(response, "status", "saved");
+							cJSON_AddBoolToObject(response, "tls_enabled", mqtt_rt_cfg.tls_enabled);
+							cJSON_AddNumberToObject(response, "sec_tag", mqtt_rt_cfg.sec_tag);
+							cJSON_AddStringToObject(response, "note",
+								"Send mqtt_restart to reconnect with new TLS settings");
+
+						} else if (strcmp(command->valuestring, "set_power_mode") == 0) {
+							cJSON *mode_j = cJSON_GetObjectItem(received_json, "mode");
+							if (mode_j && cJSON_IsString(mode_j)) {
+								if (strcmp(mode_j->valuestring, "high") == 0) {
+									mqtt_rt_cfg.power_mode = POWER_MODE_HIGH;
+								} else {
+									mqtt_rt_cfg.power_mode = POWER_MODE_NORMAL;
+								}
+								uint8_t v = (uint8_t)mqtt_rt_cfg.power_mode;
+								settings_save_one("app/mqtt/power_mode", &v, sizeof(v));
+								cJSON_AddStringToObject(response, "status", "ok");
+								cJSON_AddStringToObject(response, "power_mode",
+									mqtt_rt_cfg.power_mode == POWER_MODE_HIGH ? "high" : "normal");
+								LOG_INF("Power mode changed to %s",
+									mqtt_rt_cfg.power_mode == POWER_MODE_HIGH ? "HIGH" : "NORMAL");
+								/* Reschedule heartbeat with new interval */
+								uint32_t hb = (mqtt_rt_cfg.power_mode == POWER_MODE_HIGH)
+									     ? MQTT_HIGH_POWER_HEARTBEAT_SEC
+									     : MQTT_HEARTBEAT_INTERVAL_SEC;
+								k_work_reschedule(&mqtt_ctx.data_send_work, K_SECONDS(hb));
+								/* Notify main module about trigger interval change via ZBUS */
+								int new_interval = (mqtt_rt_cfg.power_mode == POWER_MODE_HIGH)
+										   ? MQTT_HIGH_POWER_TRIGGER_INTERVAL_SEC
+										   : CONFIG_APP_MODULE_TRIGGER_TIMEOUT_SECONDS;
+								int pub_ret = zbus_chan_pub(&TIMER_CHAN, &new_interval, K_MSEC(500));
+								if (pub_ret) {
+									LOG_WRN("Failed to notify main of interval change: %d", pub_ret);
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "invalid_mode");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"set_power_mode\",\"mode\":\"high\"}");
+							}
+
 						} else {
-							/* Unknown command - forward it to UART anyway as a passthrough */
-							LOG_INF("Unknown command, forwarding to UART: %s", command->valuestring);
-							
-							msg.type = CUSTOM_MQTT_EVT_FORWARD_UART;
-							msg.forward_uart.data = command->valuestring;
-							msg.forward_uart.len = strlen(command->valuestring);
-							zbus_chan_pub(&CUSTOM_MQTT_CHAN, &msg, K_NO_WAIT);
-							
-							cJSON_AddStringToObject(response, "status", "forwarded_to_uart");
+							/* Unknown command — do NOT forward to UART blindly.
+							 * Only structured ESL commands (esl_scan, esl_command, etc.)
+							 * and uart_passthrough are forwarded. */
+							LOG_WRN("Unknown MQTT command (rejected): %s", command->valuestring);
+							cJSON_AddStringToObject(response, "status", "unknown_command");
 						}
 						
 						cJSON_AddStringToObject(response, "command_processed", command->valuestring);
@@ -383,6 +1017,7 @@ publish_skip:
 
 	case MQTT_EVT_PUBACK:
 		LOG_DBG("MQTT publish acknowledged (message_id: %u)", evt->param.puback.message_id);
+		last_mqtt_activity_ms = k_uptime_get();
 		/* Reset failure counter on successful publish */
 		if (mqtt_ctx.publish_failures > 0) {
 			mqtt_ctx.publish_failures = MAX(0, mqtt_ctx.publish_failures - 1);
@@ -393,6 +1028,7 @@ publish_skip:
 		LOG_INF(">>> MQTT_EVT_SUBACK received! <<<");
 		LOG_INF("MQTT subscription acknowledged (message_id: %u)", evt->param.suback.message_id);
 		LOG_INF("Successfully subscribed to topic: %s", MQTT_SUB_TOPIC);
+		last_mqtt_activity_ms = k_uptime_get();
 		break;
 
 	case MQTT_EVT_UNSUBACK:
@@ -401,6 +1037,7 @@ publish_skip:
 
 	case MQTT_EVT_PINGRESP:
 		LOG_DBG("MQTT ping response received");
+		last_mqtt_activity_ms = k_uptime_get();
 		break;
 
 	default:
@@ -420,49 +1057,85 @@ static void connect_work_handler(struct k_work *work)
 	}
 }
 
+static void mqtt_restart_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	LOG_INF("MQTT restart: applying new config (host=%s port=%u user=%s)",
+		mqtt_rt_cfg.host, mqtt_rt_cfg.port, mqtt_rt_cfg.username);
+	if (mqtt_ctx.state == MQTT_STATE_CONNECTED ||
+	    mqtt_ctx.state == MQTT_STATE_CONNECTING) {
+		custom_mqtt_disconnect();
+	}
+	mqtt_ctx.state = MQTT_STATE_IDLE;
+	k_work_reschedule(&mqtt_ctx.connect_work, K_SECONDS(3));
+}
+
+static void mqtt_inactivity_work_fn(struct k_work *work)
+{
+	int64_t now = k_uptime_get();
+	int64_t elapsed_ms = now - last_mqtt_activity_ms;
+
+	if (elapsed_ms >= (int64_t)MQTT_INACTIVITY_WATCHDOG_SEC * 1000) {
+		LOG_ERR("No MQTT activity for %lld s — saving reboot flag and rebooting",
+			elapsed_ms / 1000);
+		uint8_t flag = 1;
+
+		settings_save_one("app/watchdog/mqtt_inactive", &flag, sizeof(flag));
+		/* Brief delay to let flash write complete */
+		k_sleep(K_MSEC(500));
+		sys_reboot(SYS_REBOOT_COLD);
+	} else {
+		/* Not yet expired — reschedule to check at expiry time */
+		int64_t remaining_ms = (int64_t)MQTT_INACTIVITY_WATCHDOG_SEC * 1000 - elapsed_ms;
+
+		k_work_reschedule(&mqtt_inactivity_work, K_MSEC(remaining_ms));
+	}
+}
+
 static void data_send_work_handler(struct k_work *work)
 {
-	if (mqtt_ctx.state == MQTT_STATE_CONNECTED) {
-		k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
-		
-		cJSON *json = cJSON_CreateObject();
-		if (json) {
-			cJSON_AddStringToObject(json, "device_id", MQTT_CLIENT_ID);
-			cJSON_AddStringToObject(json, "type", "heartbeat");
-			cJSON_AddNumberToObject(json, "timestamp", k_uptime_get());
-			cJSON_AddNumberToObject(json, "uptime_ms", k_uptime_get());
-			cJSON_AddStringToObject(json, "firmware_version", "v0.0.0-dev");
-			cJSON_AddNumberToObject(json, "sequence", mqtt_ctx.publish_sequence + 1);
-			
-		/* Add diagnostic information */
+	if (mqtt_ctx.state != MQTT_STATE_CONNECTED) {
+		return;
+	}
+
+	cJSON *json = cJSON_CreateObject();
+
+	if (json) {
+		cJSON_AddStringToObject(json, "type", "heartbeat");
+		cJSON_AddNumberToObject(json, "uptime_ms", k_uptime_get());
+		cJSON_AddStringToObject(json, "firmware_version", APP_VERSION_STRING);
+		cJSON_AddNumberToObject(json, "sequence", mqtt_ctx.publish_sequence + 1);
+		cJSON_AddStringToObject(json, "power_mode",
+					mqtt_rt_cfg.power_mode == POWER_MODE_HIGH ? "high" : "normal");
+
 		cJSON *diagnostics = cJSON_CreateObject();
+
 		if (diagnostics) {
-			cJSON_AddNumberToObject(diagnostics, "publish_failures", mqtt_ctx.publish_failures);
-			cJSON_AddNumberToObject(diagnostics, "total_publishes", mqtt_ctx.publish_sequence);
-			cJSON_AddBoolToObject(diagnostics, "network_connected", mqtt_ctx.network_connected);
-			cJSON_AddNumberToObject(diagnostics, "mqtt_state", mqtt_ctx.state);
+			cJSON_AddNumberToObject(diagnostics, "publish_failures",
+						mqtt_ctx.publish_failures);
+			cJSON_AddNumberToObject(diagnostics, "total_publishes",
+						mqtt_ctx.publish_sequence);
+			cJSON_AddBoolToObject(diagnostics, "network_connected",
+					   mqtt_ctx.network_connected);
 			cJSON_AddItemToObject(json, "diagnostics", diagnostics);
 		}
-		
-		char *json_string = cJSON_Print(json);
-			if (json_string) {
-				int ret = mqtt_publish_data(json_string, strlen(json_string));
-				if (ret == 0) {
-					LOG_INF("Heartbeat message sent (seq: %u, failures: %u)", 
-						mqtt_ctx.publish_sequence, mqtt_ctx.publish_failures);
-				} else {
-					LOG_ERR("Failed to send heartbeat: %d", ret);
-				}
-				cJSON_free(json_string);
-			}
-			cJSON_Delete(json);
+
+		int ret = safe_publish_json(json, "heartbeat");
+
+		if (ret == 0) {
+			LOG_INF("Heartbeat sent (seq: %u, failures: %u)",
+				mqtt_ctx.publish_sequence, mqtt_ctx.publish_failures);
+		} else {
+			LOG_ERR("Failed to send heartbeat: %d", ret);
 		}
-		
-		k_mutex_unlock(&mqtt_ctx.data_mutex);
-		
-		/* Schedule next heartbeat */
-		k_work_schedule(&mqtt_ctx.data_send_work, K_SECONDS(MQTT_HEARTBEAT_INTERVAL_SEC));
+		cJSON_Delete(json);
 	}
+
+	/* Schedule next heartbeat — interval depends on power mode */
+	uint32_t hb_interval = (mqtt_rt_cfg.power_mode == POWER_MODE_HIGH)
+				? MQTT_HIGH_POWER_HEARTBEAT_SEC
+				: MQTT_HEARTBEAT_INTERVAL_SEC;
+	k_work_schedule(&mqtt_ctx.data_send_work, K_SECONDS(hb_interval));
 }
 
 static int custom_mqtt_connect(void)
@@ -502,9 +1175,10 @@ static int custom_mqtt_connect(void)
 	/* Set up client configuration */
 	mqtt_ctx.client.broker = &mqtt_ctx.broker_addr;
 	mqtt_ctx.client.evt_cb = mqtt_evt_handler;
-	mqtt_ctx.client.client_id.utf8 = mqtt_client_id;
-	mqtt_ctx.client.client_id.size = strlen(mqtt_client_id);
+	mqtt_ctx.client.client_id.utf8 = (uint8_t *)mqtt_rt_cfg.client_id;
+	mqtt_ctx.client.client_id.size = strlen(mqtt_rt_cfg.client_id);
 	mqtt_ctx.client.protocol_version = MQTT_VERSION_3_1_1;
+	mqtt_ctx.client.clean_session = 0; /* Persistent session — broker queues QoS1 commands during PSM sleep and delivers on reconnect */
 	mqtt_ctx.client.rx_buf = mqtt_ctx.rx_buffer;
 	mqtt_ctx.client.rx_buf_size = sizeof(mqtt_ctx.rx_buffer);
 	mqtt_ctx.client.tx_buf = mqtt_ctx.tx_buffer;
@@ -534,30 +1208,31 @@ static int custom_mqtt_connect(void)
 	}
 
 	LOG_INF("Configuring transport settings");
-	/* Configure Transport */
-#if defined(CONFIG_APP_CUSTOM_MQTT_USE_TLS)
-	mqtt_ctx.client.transport.type = MQTT_TRANSPORT_SECURE;
-	
-	struct mqtt_sec_config *tls_config = &mqtt_ctx.client.transport.tls.config;
-	tls_config->peer_verify = TLS_PEER_VERIFY_NONE;  /* Disable peer verification for now */
-	tls_config->cipher_list = NULL;
-	
-	/* Use security tags if configured, otherwise use system CA certificates */
-	if (CONFIG_APP_CUSTOM_MQTT_SEC_TAG > 0) {
-		tls_config->sec_tag_count = ARRAY_SIZE(sec_tag_list);
-		tls_config->sec_tag_list = sec_tag_list;
-		LOG_INF("Using security tag: %d", CONFIG_APP_CUSTOM_MQTT_SEC_TAG);
+	/* Configure Transport — use runtime TLS flag (overrides compile-time default) */
+	if (mqtt_rt_cfg.tls_enabled) {
+		mqtt_ctx.client.transport.type = MQTT_TRANSPORT_SECURE;
+
+		struct mqtt_sec_config *tls_config = &mqtt_ctx.client.transport.tls.config;
+		tls_config->peer_verify = TLS_PEER_VERIFY_NONE;
+		tls_config->cipher_list = NULL;
+
+		if (mqtt_rt_cfg.sec_tag > 0) {
+			rt_sec_tag_list[0] = (sec_tag_t)mqtt_rt_cfg.sec_tag;
+			tls_config->sec_tag_count = 1;
+			tls_config->sec_tag_list = rt_sec_tag_list;
+			LOG_INF("Using runtime security tag: %u", mqtt_rt_cfg.sec_tag);
+		} else {
+			tls_config->sec_tag_count = 0;
+			tls_config->sec_tag_list = NULL;
+			LOG_INF("TLS enabled but no security tag configured");
+		}
+
+		tls_config->hostname = MQTT_BROKER_HOSTNAME;
+		LOG_INF("Using TLS transport");
 	} else {
-		tls_config->sec_tag_count = 0;
-		tls_config->sec_tag_list = NULL;
-		LOG_INF("Using system CA certificates");
+		mqtt_ctx.client.transport.type = MQTT_TRANSPORT_NON_SECURE;
+		LOG_INF("Using non-secure transport (TCP)");
 	}
-	
-	tls_config->hostname = MQTT_BROKER_HOSTNAME;
-#else
-	mqtt_ctx.client.transport.type = MQTT_TRANSPORT_NON_SECURE;
-	LOG_INF("Using non-secure transport (TCP)");
-#endif
 
 	LOG_INF("Starting MQTT connection to %s:%d", MQTT_BROKER_HOSTNAME, MQTT_BROKER_PORT);
 	LOG_INF("Client ID: %s, Username: %s", MQTT_CLIENT_ID, MQTT_USERNAME);
@@ -634,23 +1309,6 @@ static bool validate_sensor_data(double value, double min, double max)
 	return true;
 }
 
-static bool validate_json_string(const char *json_str)
-{
-	if (!json_str) {
-		return false;
-	}
-	
-	/* Basic validation - check if it's a valid JSON */
-	cJSON *test = cJSON_Parse(json_str);
-	if (!test) {
-		LOG_ERR("Invalid JSON string");
-		return false;
-	}
-	
-	cJSON_Delete(test);
-	return true;
-}
-
 static int safe_publish_json(cJSON *json, const char *data_type)
 {
 	char *json_string;
@@ -667,25 +1325,21 @@ static int safe_publish_json(cJSON *json, const char *data_type)
 	
 	json_string = cJSON_Print(json);
 	if (json_string) {
-		if (validate_json_string(json_string)) {
-			if (mqtt_ctx.state == MQTT_STATE_CONNECTED) {
-				ret = mqtt_publish_data(json_string, strlen(json_string));
-				if (ret == 0) {
-					LOG_DBG("Successfully published %s data", data_type ? data_type : "JSON");
-				} else {
-					LOG_ERR("Failed to publish %s data: %d", data_type ? data_type : "JSON", ret);
-				}
+		if (mqtt_ctx.state == MQTT_STATE_CONNECTED) {
+			ret = mqtt_publish_data(json_string, strlen(json_string));
+			if (ret == 0) {
+				LOG_DBG("Published %s", data_type ? data_type : "JSON");
+				last_mqtt_activity_ms = k_uptime_get();
 			} else {
-				LOG_WRN("MQTT not connected, cannot publish %s data", data_type ? data_type : "JSON");
-				ret = -ENOTCONN;
+				LOG_ERR("Failed to publish %s: %d", data_type ? data_type : "JSON", ret);
 			}
 		} else {
-			LOG_ERR("JSON validation failed for %s data", data_type ? data_type : "JSON");
-			ret = -EINVAL;
+			LOG_WRN("MQTT not connected, cannot publish %s", data_type ? data_type : "JSON");
+			ret = -ENOTCONN;
 		}
 		cJSON_free(json_string);
 	} else {
-		LOG_ERR("Failed to serialize %s JSON data", data_type ? data_type : "JSON");
+		LOG_ERR("Failed to serialize %s JSON", data_type ? data_type : "JSON");
 	}
 	
 	return ret;
@@ -850,13 +1504,22 @@ static void connected_entry(void *obj)
 	
 	/* Send initial connection message */
 	k_sleep(K_MSEC(1000)); /* Give subscription time to complete */
-	
+
+	/* Successful connection — reset reconnect delay back to base */
+	mqtt_reconnect_delay_sec = MQTT_RECONNECT_BASE_DELAY_SEC;
+	mqtt_ctx.publish_failures = 0;
+
+	/* Mark activity and start inactivity watchdog */
+	last_mqtt_activity_ms = k_uptime_get();
+	k_work_reschedule(&mqtt_inactivity_work, K_SECONDS(MQTT_INACTIVITY_WATCHDOG_SEC));
+
 	cJSON *json = cJSON_CreateObject();
 	if (json) {
 		cJSON_AddStringToObject(json, "device_id", MQTT_CLIENT_ID);
 		cJSON_AddStringToObject(json, "status", "connected");
 		cJSON_AddNumberToObject(json, "timestamp", k_uptime_get());
 		cJSON_AddStringToObject(json, "message", "Device connected to MQTT broker");
+		cJSON_AddStringToObject(json, "build", APP_VERSION_STRING);
 		
 		char *json_string = cJSON_Print(json);
 		if (json_string) {
@@ -870,7 +1533,41 @@ static void connected_entry(void *obj)
 		}
 		cJSON_Delete(json);
 	}
-	
+
+	/* If device rebooted due to MQTT inactivity, report it once and clear the flag */
+	if (mqtt_inactive_reboot_flag) {
+		cJSON *rb_json = cJSON_CreateObject();
+
+		if (rb_json) {
+			cJSON_AddStringToObject(rb_json, "device_id", MQTT_CLIENT_ID);
+			cJSON_AddStringToObject(rb_json, "type", "reboot_reason");
+			cJSON_AddStringToObject(rb_json, "reason", "mqtt_inactivity");
+			cJSON_AddNumberToObject(rb_json, "watchdog_timeout_sec",
+						MQTT_INACTIVITY_WATCHDOG_SEC);
+			cJSON_AddNumberToObject(rb_json, "timestamp", k_uptime_get());
+
+			char *rb_str = cJSON_Print(rb_json);
+
+			if (rb_str) {
+				int rc = mqtt_publish_data(rb_str, strlen(rb_str));
+
+				if (rc == 0) {
+					LOG_WRN("Reboot-reason message sent (mqtt_inactivity)");
+					/* Clear flag in flash — reported successfully */
+					uint8_t flag = 0;
+
+					settings_save_one("app/watchdog/mqtt_inactive",
+							  &flag, sizeof(flag));
+					mqtt_inactive_reboot_flag = false;
+				} else {
+					LOG_ERR("Failed to send reboot-reason: %d (will retry next connect)", rc);
+				}
+				cJSON_free(rb_str);
+			}
+			cJSON_Delete(rb_json);
+		}
+	}
+
 	/* Start periodic data sending */
 	k_work_schedule(&mqtt_ctx.data_send_work, K_SECONDS(10));
 	
@@ -883,22 +1580,33 @@ static void connected_entry(void *obj)
 
 static void connected_run(void *obj)
 {
-	/* Poll MQTT client for events */
-	int ret = mqtt_input(&mqtt_ctx.client);
-	if (ret < 0 && ret != -EAGAIN) {
-		LOG_ERR("MQTT input error: %d", ret);
-		smf_set_state(&sm_ctx, &mqtt_states[MQTT_STATE_ERROR]);
-		return;
+	int ret;
+
+	/* Use poll() so we only call mqtt_input when data is actually available.
+	 * This avoids unnecessary blocking and keeps the thread responsive. */
+	struct zsock_pollfd fds = {
+		.fd = mqtt_ctx.client.transport.tcp.sock,
+		.events = ZSOCK_POLLIN,
+	};
+
+	ret = zsock_poll(&fds, 1, 0); /* non-blocking check */
+	if (ret > 0 && (fds.revents & ZSOCK_POLLIN)) {
+		ret = mqtt_input(&mqtt_ctx.client);
+		if (ret < 0 && ret != -EAGAIN) {
+			LOG_ERR("MQTT input error: %d", ret);
+			smf_set_state(&sm_ctx, &mqtt_states[MQTT_STATE_ERROR]);
+			return;
+		}
 	}
-	
-	/* Maintain MQTT connection */
+
+	/* Maintain MQTT connection (keepalive pings) */
 	ret = mqtt_live(&mqtt_ctx.client);
 	if (ret < 0 && ret != -EAGAIN) {
 		LOG_ERR("MQTT live error: %d", ret);
 		smf_set_state(&sm_ctx, &mqtt_states[MQTT_STATE_ERROR]);
 		return;
 	}
-	
+
 	if (!mqtt_ctx.network_connected) {
 		LOG_INF("Network disconnected, transitioning to disconnecting state");
 		smf_set_state(&sm_ctx, &mqtt_states[MQTT_STATE_DISCONNECTING]);
@@ -909,13 +1617,14 @@ static void disconnecting_entry(void *obj)
 {
 	LOG_DBG("Entering MQTT disconnecting state");
 	mqtt_ctx.state = MQTT_STATE_DISCONNECTING;
-	
+
 	/* Cancel ongoing work */
 	k_work_cancel_delayable(&mqtt_ctx.data_send_work);
+	k_work_cancel_delayable(&mqtt_inactivity_work);
 #if defined(CONFIG_APP_LOCATION)
 	k_work_cancel_delayable(&mqtt_ctx.location_trigger_work);
 #endif
-	
+
 	custom_mqtt_disconnect();
 }
 
@@ -928,27 +1637,26 @@ static void error_entry(void *obj)
 {
 	LOG_DBG("Entering MQTT error state");
 	mqtt_ctx.state = MQTT_STATE_ERROR;
-	
+
 	/* Cancel any pending work */
 	k_work_cancel_delayable(&mqtt_ctx.data_send_work);
+	k_work_cancel_delayable(&mqtt_inactivity_work);
 #if defined(CONFIG_APP_LOCATION)
 	k_work_cancel_delayable(&mqtt_ctx.location_trigger_work);
 #endif
-	
-	/* Reset failure counters for exponential backoff */
-	static uint32_t reconnect_delay = MQTT_RECONNECT_BASE_DELAY_SEC;
-	
+
+	/* Exponential backoff using module-level variable (resets on successful connect) */
 	if (mqtt_ctx.publish_failures > MQTT_MAX_PUBLISH_FAILURES) {
-		/* Exponential backoff for repeated failures */
-		reconnect_delay = MIN(reconnect_delay * 2, MQTT_RECONNECT_MAX_DELAY_SEC);
+		mqtt_reconnect_delay_sec = MIN(mqtt_reconnect_delay_sec * 2,
+					       MQTT_RECONNECT_MAX_DELAY_SEC);
 	} else {
-		reconnect_delay = MQTT_RECONNECT_BASE_DELAY_SEC; /* Reset on success */
+		mqtt_reconnect_delay_sec = MQTT_RECONNECT_BASE_DELAY_SEC;
 	}
-	
-	LOG_WRN("MQTT error state, will retry connection in %u seconds", reconnect_delay);
-	
+
+	LOG_WRN("MQTT error state, will retry connection in %u seconds", mqtt_reconnect_delay_sec);
+
 	/* Schedule reconnection attempt */
-	k_work_schedule(&mqtt_ctx.connect_work, K_SECONDS(reconnect_delay));
+	k_work_schedule(&mqtt_ctx.connect_work, K_SECONDS(mqtt_reconnect_delay_sec));
 }
 
 static void error_run(void *obj)
@@ -1074,11 +1782,6 @@ static void process_location_data(const struct location_msg *msg)
 		goto cleanup;
 	}
 	
-	if (!validate_json_string(json_string)) {
-		LOG_ERR("Generated invalid JSON for location data");
-		goto cleanup;
-	}
-	
 	/* Publish if connected */
 	if (mqtt_ctx.state == MQTT_STATE_CONNECTED) {
 		ret = mqtt_publish_data(json_string, strlen(json_string));
@@ -1167,6 +1870,19 @@ cleanup:
 #if defined(CONFIG_APP_POWER)
 static void process_power_data(const struct power_msg *msg)
 {
+	/* If sensor data is invalid, publish a minimal status message */
+	if (!msg->data_valid) {
+		LOG_WRN("Power data invalid, publishing status only");
+		cJSON *json = cJSON_CreateObject();
+		if (json) {
+			cJSON_AddStringToObject(json, "type", "power");
+			cJSON_AddBoolToObject(json, "data_valid", false);
+			safe_publish_json(json, "power");
+			cJSON_Delete(json);
+		}
+		return;
+	}
+
 	/* Validate power data using helper function */
 	if (!validate_sensor_data(msg->percentage, MQTT_BATTERY_MIN_PERCENT, MQTT_BATTERY_MAX_PERCENT)) {
 		return;
@@ -1188,6 +1904,8 @@ static void process_power_data(const struct power_msg *msg)
 	cJSON_AddNumberToObject(power_data, "voltage", round(msg->voltage * 1000) / 1000.0);
 	cJSON_AddNumberToObject(power_data, "current_ma", round(msg->current_ma * 10) / 10.0);
 	cJSON_AddNumberToObject(power_data, "temperature", round(msg->temperature * 10) / 10.0);
+	cJSON_AddBoolToObject(power_data, "data_valid", msg->data_valid);
+	cJSON_AddBoolToObject(power_data, "charging", msg->charging);
 	
 #if defined(CONFIG_APP_POWER_TIMESTAMP)
 	if (msg->timestamp > 0) {
@@ -1200,8 +1918,9 @@ static void process_power_data(const struct power_msg *msg)
 	/* Use safe publish function */
 	int ret = safe_publish_json(json, "power");
 	if (ret == 0) {
-		LOG_INF("Power data published: %.1f%%, %.3fV, %.1fmA, %.1f°C", 
-			msg->percentage, msg->voltage, msg->current_ma, msg->temperature);
+		LOG_INF("Power data published: %.1f%%, %.3fV, %.1fmA, %.1f°C, charging=%s", 
+			msg->percentage, msg->voltage, msg->current_ma, msg->temperature,
+			msg->charging ? "yes" : "no");
 	}
 
 cleanup:
@@ -1241,44 +1960,140 @@ static void process_uart_sensor_data(const struct uart_sensor_msg *msg)
 	}
 	
 	if (msg->type == UART_SENSOR_GENERIC_RESPONSE) {
-		LOG_INF("UART generic response received: %s", msg->response_text);
-		
-		/* Publish generic response to MQTT */
+		/* Only publish when debug echo is active — off by default in production. */
+		if (uart_debug_echo_active) {
+			cJSON *dbg = cJSON_CreateObject();
+			if (dbg) {
+				cJSON_AddStringToObject(dbg, "type", "uart_debug");
+				cJSON_AddStringToObject(dbg, "line", msg->response_text);
+				safe_publish_json(dbg, "uart_debug");
+				cJSON_Delete(dbg);
+			}
+		} else {
+			LOG_DBG("UART generic response (debug echo off): %s", msg->response_text);
+		}
+		return;
+	}
+
+	/* ---- ESL-specific events: publish structured data ---- */
+
+	if (msg->type == UART_SENSOR_ESL_TAG_FOUND) {
+		LOG_INF("ESL tag discovered: %s", msg->probe_id);
 		cJSON *json = cJSON_CreateObject();
 		if (json) {
-			cJSON_AddStringToObject(json, "type", "uart_response");
-			cJSON_AddStringToObject(json, "data", msg->response_text);
-			cJSON_AddNumberToObject(json, "timestamp", k_uptime_get());
-			safe_publish_json(json, "uart_response");
+			cJSON_AddStringToObject(json, "type", "esl_tag_found");
+			cJSON_AddStringToObject(json, "mac", msg->probe_id);
+			safe_publish_json(json, "esl_tag_found");
 			cJSON_Delete(json);
 		}
+		return;
+	}
+
+	if (msg->type == UART_SENSOR_ESL_TAG_CONFIGURED) {
+		LOG_INF("ESL tag configured: %s", msg->probe_id);
+		cJSON *json = cJSON_CreateObject();
+		if (json) {
+			cJSON_AddStringToObject(json, "type", "esl_tag_configured");
+			cJSON_AddStringToObject(json, "esl_id", msg->probe_id);
+			safe_publish_json(json, "esl_tag_configured");
+			cJSON_Delete(json);
+		}
+		return;
+	}
+
+	if (msg->type == UART_SENSOR_ESL_TAG_DISCONNECTED) {
+		LOG_INF("ESL tag disconnected: %s", msg->tag_info.mac);
+		cJSON *json = cJSON_CreateObject();
+		if (json) {
+			cJSON_AddStringToObject(json, "type", "esl_tag_disconnected");
+			cJSON_AddStringToObject(json, "mac", msg->tag_info.mac);
+			safe_publish_json(json, "esl_tag_disconnected");
+			cJSON_Delete(json);
+		}
+		return;
+	}
+
+	if (msg->type == UART_SENSOR_ESL_NUS_RESPONSE) {
+		LOG_INF("ESL NUS data: %s bat=%umV up=%us",
+			msg->probe_id, msg->tag_info.battery_mv, msg->tag_info.uptime_s);
+		cJSON *json = cJSON_CreateObject();
+		if (json) {
+			cJSON_AddStringToObject(json, "type", "esl_sensor_data");
+			cJSON_AddStringToObject(json, "esl_id", msg->probe_id);
+			/* Include human-readable name if known */
+			if (msg->tag_info.name[0] != '\0') {
+				cJSON_AddStringToObject(json, "name", msg->tag_info.name);
+			}
+			cJSON_AddNumberToObject(json, "battery_mv", msg->tag_info.battery_mv);
+			cJSON_AddNumberToObject(json, "battery_pct",
+				(double)roundf(msg->probe_battery * 10.0f) / 10.0);
+			cJSON_AddNumberToObject(json, "uptime_s", msg->tag_info.uptime_s);
+			cJSON_AddNumberToObject(json, "flags", msg->tag_info.flags);
+			if (msg->tag_info.temperature != 0.0f) {
+				cJSON_AddNumberToObject(json, "temperature",
+					(double)roundf(msg->tag_info.temperature * 100.0f) / 100.0);
+			}
+			safe_publish_json(json, "esl_sensor_data");
+			cJSON_Delete(json);
+		}
+		return;
+	}
+
+	if (msg->type == UART_SENSOR_ESL_AP_READY) {
+		LOG_INF("nRF5340 ESL AP ready");
+		/* Don't publish boot event — not useful to cloud */
+		return;
+	}
+
+	if (msg->type == UART_SENSOR_ESL_TAG_CONNECTED) {
+		LOG_INF("ESL tag BLE connected: %s", msg->probe_id);
+		cJSON *json = cJSON_CreateObject();
+		if (json) {
+			cJSON_AddStringToObject(json, "type", "esl_tag_connected");
+			cJSON_AddStringToObject(json, "mac", msg->probe_id);
+			char esl_id[16];
+			snprintf(esl_id, sizeof(esl_id), "ESL_0x%04X",
+				 msg->tag_info.esl_addr);
+			cJSON_AddStringToObject(json, "esl_id", esl_id);
+			safe_publish_json(json, "esl_tag_connected");
+			cJSON_Delete(json);
+		}
+		return;
+	}
+
+	if (msg->type == UART_SENSOR_ESL_NAME_RESPONSE) {
+		LOG_INF("ESL sensor name: 0x%04X = '%s'",
+			msg->tag_info.esl_addr, msg->tag_info.name);
+		cJSON *json = cJSON_CreateObject();
+		if (json) {
+			char esl_id_str[16];
+
+			snprintf(esl_id_str, sizeof(esl_id_str),
+				 "0x%04X", msg->tag_info.esl_addr);
+			cJSON_AddStringToObject(json, "type", "sensor_name");
+			cJSON_AddStringToObject(json, "esl_addr", esl_id_str);
+			cJSON_AddStringToObject(json, "name",
+				msg->tag_info.name[0] ? msg->tag_info.name : "unknown");
+			safe_publish_json(json, "sensor_name");
+			cJSON_Delete(json);
+		}
+		return;
+	}
+
+	if (msg->type == UART_SENSOR_DATA_REQUEST) {
+		/* Internal trigger from main.c — not data, silently ignore */
 		return;
 	}
 	
 	if (msg->type != UART_SENSOR_DATA_RESPONSE) {
-		LOG_DBG("Ignoring non-data UART sensor message type: %d", msg->type);
+		LOG_DBG("Ignoring unhandled UART sensor message type: %d", msg->type);
 		return;
 	}
 	
 	/* Create JSON payload */
-	/* Check if we have valid sensor data */
+	/* No valid sensor data yet — skip publishing */
 	if (strlen(msg->probe_id) == 0) {
-		LOG_DBG("No sensor connected (empty probe ID)");
-		
-		json = cJSON_CreateObject();
-		if (json) {
-			cJSON_AddStringToObject(json, "type", "uart_sensor");
-			cJSON_AddStringToObject(json, "status", "no_sensors_present");
-			cJSON_AddNumberToObject(json, "timestamp", k_uptime_get());
-			
-			/* Use safe publish function */
-			int ret = safe_publish_json(json, "uart_sensor_status");
-			if (ret == 0) {
-				LOG_INF("Published 'no sensors present' status");
-			}
-			cJSON_Delete(json);
-			json = NULL; /* Reset for safety */
-		}
+		LOG_DBG("No ESL sensor data yet (no tags) — skipping publish");
 		return;
 	}
 
@@ -1347,57 +2162,39 @@ cleanup:
 #if defined(CONFIG_APP_BUTTON)
 static void process_button_msg(const struct button_msg *msg)
 {
-	LOG_INF("Button %d %s detected", msg->button_number, 
+	LOG_INF("Button %d %s detected", msg->button_number,
 		msg->type == BUTTON_PRESS_SHORT ? "short press" : "long press");
-	
-	if (msg->button_number == 1) {
-		if (msg->type == BUTTON_PRESS_SHORT) {
-			/* Short press: trigger power measurement */
-			LOG_INF("Requesting power measurement via button short press");
-			
-			/* Request power measurement directly */
-			int ret = power_sample_request();
-			if (ret != 0) {
-				LOG_ERR("Failed to request power measurement: %d", ret);
-				return;
-			}
-			
-			/* Get the power data and publish it */
-			struct power_msg power_data;
-			ret = power_get_current_data(&power_data);
-			if (ret == 0) {
-				k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
-				process_power_data(&power_data);
-				k_mutex_unlock(&mqtt_ctx.data_mutex);
-				LOG_INF("Button-triggered power data published: %.1f%%", power_data.percentage);
-			} else {
-				LOG_ERR("Failed to get power data: %d", ret);
-			}
+
+	if (msg->button_number != 1) {
+		return;
+	}
+
+	if (msg->type == BUTTON_PRESS_SHORT) {
+		/* Short press: exactly one power sample + one ESL NUS sensors snapshot.
+		 * Do NOT call process_power_data() directly — let POWER_CHAN publish once. */
+		LOG_INF("Button: requesting power + ESL sensor snapshot");
+
+		int ret = power_sample_request();
+		if (ret != 0) {
+			LOG_WRN("Failed to request power: %d", ret);
+		}
 
 #if defined(CONFIG_APP_UART_SENSOR)
-			/* Also trigger UART sensor data generation */
-			LOG_INF("Requesting UART sensor data via button press");
-			ret = uart_sensor_sample_request();
-			if (ret != 0) {
-				LOG_ERR("Failed to request UART sensor data: %d", ret);
-			} else {
-				LOG_INF("UART sensor data request triggered successfully");
+		int n = uart_sensor_esl_get_tag_count();
+		if (n > 0) {
+			for (int i = 1; i <= n; i++) {
+				ret = uart_sensor_esl_nus_sensors(i);
+				if (ret != 0) {
+					LOG_WRN("Failed to poll ESL tag %d sensors: %d", i, ret);
+				}
 			}
-#endif
-		} else if (msg->type == BUTTON_PRESS_LONG) {
-			/* Long press: trigger location request */
-			LOG_INF("Requesting location update via button long press");
-			
-#if defined(CONFIG_APP_LOCATION)
-			trigger_location_request();
-			LOG_INF("Location request triggered via button long press");
-#else
-			LOG_WRN("Location module not enabled - cannot process location request");
-#endif
+			LOG_INF("ESL NUS sensors poll triggered for %d tag(s)", n);
+		} else {
+			LOG_INF("No ESL tags known — only power data will be published");
 		}
-	} else {
-		LOG_DBG("Ignoring button %d press (only button 1 is handled)", msg->button_number);
+#endif
 	}
+	/* Long press: reserved for future use */
 }
 #endif
 
@@ -1454,7 +2251,9 @@ static void custom_mqtt_thread(void)
 	while (1) {
 		/* Wait for messages on subscribed channels */
 		const void *msg_data;
-		ret = zbus_sub_wait_msg(&custom_mqtt_subscriber, &chan, &msg_data, K_MSEC(1000));
+		/* Short timeout — smf_run_state at bottom drives mqtt_input/mqtt_live.
+		 * Must run frequently so incoming MQTT messages are read promptly. */
+		ret = zbus_sub_wait_msg(&custom_mqtt_subscriber, &chan, &msg_data, K_MSEC(100));
 		if (ret == 0) {
 			/* Process messages with proper synchronization and retry logic */
 			if (chan == &NETWORK_CHAN) {
@@ -1559,21 +2358,45 @@ static int custom_mqtt_init(void)
 {
 	/* Initialize mutex for thread safety */
 	k_mutex_init(&mqtt_ctx.data_mutex);
-	
-	/* Initialize work queue */
+
+	/* Initialize runtime MQTT config from compile-time Kconfig defaults */
+	strncpy(mqtt_rt_cfg.host, MQTT_BROKER_HOSTNAME_DEFAULT, sizeof(mqtt_rt_cfg.host) - 1);
+	mqtt_rt_cfg.port = MQTT_BROKER_PORT_DEFAULT;
+	strncpy(mqtt_rt_cfg.username, MQTT_USERNAME_DEFAULT, sizeof(mqtt_rt_cfg.username) - 1);
+	strncpy(mqtt_rt_cfg.password, MQTT_PASSWORD_DEFAULT, sizeof(mqtt_rt_cfg.password) - 1);
+	strncpy(mqtt_rt_cfg.client_id, MQTT_CLIENT_ID_DEFAULT, sizeof(mqtt_rt_cfg.client_id) - 1);
+	strncpy(mqtt_rt_cfg.pub_topic, MQTT_PUB_TOPIC_DEFAULT, sizeof(mqtt_rt_cfg.pub_topic) - 1);
+	strncpy(mqtt_rt_cfg.sub_topic, MQTT_SUB_TOPIC_DEFAULT, sizeof(mqtt_rt_cfg.sub_topic) - 1);
+	mqtt_rt_cfg.tls_enabled = IS_ENABLED(CONFIG_APP_CUSTOM_MQTT_USE_TLS);
+#if defined(CONFIG_APP_CUSTOM_MQTT_USE_TLS)
+	mqtt_rt_cfg.sec_tag = CONFIG_APP_CUSTOM_MQTT_SEC_TAG;
+#else
+	mqtt_rt_cfg.sec_tag = 0;
+#endif
+	mqtt_rt_cfg.power_mode = POWER_MODE_NORMAL;
+
+	/* Load persisted settings — overrides Kconfig defaults if previously saved */
+	settings_load();
+
+	LOG_INF("MQTT config: host=%s port=%u user=%s",
+		mqtt_rt_cfg.host, mqtt_rt_cfg.port, mqtt_rt_cfg.username);
+
+	/* Initialize work queue items */
 	k_work_init_delayable(&mqtt_ctx.connect_work, connect_work_handler);
 	k_work_init_delayable(&mqtt_ctx.data_send_work, data_send_work_handler);
+	k_work_init_delayable(&mqtt_restart_work, mqtt_restart_work_fn);
+	k_work_init_delayable(&mqtt_inactivity_work, mqtt_inactivity_work_fn);
 #if defined(CONFIG_APP_LOCATION)
 	k_work_init_delayable(&mqtt_ctx.location_trigger_work, location_trigger_work_handler);
 #endif
-	
+
 	/* Initialize counters */
 	mqtt_ctx.publish_sequence = 0;
 	mqtt_ctx.publish_failures = 0;
 	mqtt_ctx.data_validation_enabled = true;
-	
-	LOG_INF("Custom MQTT module initialized");
-	
+
+	LOG_INF("Custom MQTT module initialized — build: " __DATE__ " " __TIME__);
+
 	return 0;
 }
 

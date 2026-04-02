@@ -29,9 +29,17 @@ extern "C" {
 #define MQTT_RECONNECT_BASE_DELAY_SEC   5
 #define MQTT_RECONNECT_MAX_DELAY_SEC    300
 #define MQTT_MAX_PUBLISH_FAILURES       10
-#define MQTT_HEARTBEAT_INTERVAL_SEC     300  /* 5 minutes between heartbeats */
+#define MQTT_HEARTBEAT_INTERVAL_SEC     3600 /* 60 minutes between heartbeats */
+#define MQTT_INACTIVITY_WATCHDOG_SEC    3600 /* Reboot if no MQTT activity for this long */
 #define MQTT_CONNECTION_TIMEOUT_SEC     30
 #define MQTT_LOCATION_UPDATE_INTERVAL_SEC 300  /* 5 minutes between location updates */
+
+/* High power mode parameters */
+#define MQTT_HIGH_POWER_TRIGGER_INTERVAL_SEC  60   /* 1 minute between triggers */
+#define MQTT_HIGH_POWER_HEARTBEAT_SEC         300  /* 5 minute heartbeat */
+
+/* Runtime-configurable topic buffer size */
+#define MQTT_RT_TOPIC_MAX  128
 
 /* Data precision limits (to reduce JSON size and noise) */
 #define MQTT_TEMP_PRECISION_DECIMALS    2

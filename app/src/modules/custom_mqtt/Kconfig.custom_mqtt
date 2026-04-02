@@ -10,6 +10,12 @@ menuconfig APP_CUSTOM_MQTT
 	help
 	  Enable the custom MQTT module for connecting to t4as.org server.
 
+config APP_CUSTOM_MQTT_DEVICE_ID
+	string "Device ID"
+	default "thingy91x-asset-tracker"
+	help
+	  The device ID used for MQTT client ID and identification in JSON messages.
+
 if APP_CUSTOM_MQTT
 
 config APP_CUSTOM_MQTT_SHELL

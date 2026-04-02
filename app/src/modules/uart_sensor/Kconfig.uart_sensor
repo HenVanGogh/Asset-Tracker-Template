@@ -5,15 +5,14 @@
 #
 
 menuconfig APP_UART_SENSOR
-	bool "UART sensor module"
-	default y
-	select UART_INTERRUPT_DRIVEN
-	depends on SERIAL
-	help
-	  Enable UART sensor communication module for external sensor data.
-	  This module provides communication with external sensor probes via UART
-	  and publishes sensor data through ZBUS channels.
-
+        bool "ESL AP sensor module (SPI inter-chip bridge)"
+        default y
+        select SPI
+        select GPIO
+        help
+          Enable the ESL AP sensor communication module.
+          Communicates with the nRF5340 ESL Access Point over SPI (replacing
+          the previous UART1 link) and publishes sensor data through ZBUS channels.
 if APP_UART_SENSOR
 
 module = APP_UART_SENSOR
@@ -353,5 +352,64 @@ config APP_UART_SENSOR_STATISTICS
 	  Useful for debugging and system monitoring.
 
 endmenu # Error Handling and Recovery
+
+menu "ESL BLE Access Point Integration"
+
+config APP_UART_SENSOR_ESL_POLL_INTERVAL_SEC
+	int "ESL NUS polling interval (seconds)"
+	default 600
+	range 30 3600
+	help
+	  Interval in seconds between automatic NUS status polls for all
+	  known ESL tags. Each poll queries battery voltage, uptime, and
+	  flags from every configured tag via the nRF5340 ESL AP shell.
+	  Default is 300 s (5 minutes).
+
+config APP_UART_SENSOR_ESL_MAX_TAGS
+	int "Maximum number of tracked ESL tags"
+	default 16
+	range 1 64
+	help
+	  Maximum number of ESL BLE tags that can be tracked simultaneously
+	  in the in-RAM tag database.  Each entry requires ~96 bytes of RAM.
+
+config APP_UART_SENSOR_ESL_EXPECTED_TAGS
+	int "Expected number of ESL tags to discover"
+	default 1
+	range 0 64
+	help
+	  The gateway will keep scanning until this many tags are connected.
+	  While fewer than this number are connected, scan retries are
+	  scheduled automatically.  Set to 0 to disable the mechanism.
+	  Can also be changed at runtime via the MQTT esl_set_expected_tags
+	  command.
+
+config APP_UART_SENSOR_ESL_SCAN_RETRY_INTERVAL_SEC
+	int "Scan retry interval when tags are missing (seconds)"
+	default 60
+	range 15 3600
+	help
+	  How long to wait after a scan window closes before starting another
+	  scan when fewer than APP_UART_SENSOR_ESL_EXPECTED_TAGS tags are
+	  connected.  A scan on the nRF5340 runs for ~30 s, so the effective
+	  retry period is this value plus ~30 s.
+
+config APP_UART_SENSOR_ESL_STARTUP_DELAY_MS
+	int "Delay before ESL startup sequence (ms)"
+	default 500
+	range 100 5000
+	help
+	  Delay after nRF5340 shell prompt detection before the automatic
+	  startup sequence (PAwR start + scan) begins.
+
+config APP_UART_SENSOR_ESL_CMD_SPACING_MS
+	int "Spacing between sequential ESL commands (ms)"
+	default 2000
+	range 500 10000
+	help
+	  Minimum time between sequential shell commands sent to the
+	  nRF5340 ESL AP. Prevents shell RX buffer overflow.
+
+endmenu # ESL BLE Access Point Integration
 
 endif # APP_UART_SENSOR

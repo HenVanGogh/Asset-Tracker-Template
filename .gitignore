@@ -23,3 +23,25 @@ venv
 sanity-out*
 twister-out*
 tests/on_target/artifacts/
+
+# Binary archives
+*.tar.gz
+*.zip
+
+# Backup files
+*.bak
+
+# Debug/build output artifacts
+output
+output2
+2output
+putp
+putput
+flash_log.txt
+flash_output.txt
+
+# Python cache
+__pycache__/
+
+# Credentials overlay (keep out of version control)
+overlay-credentials.conf
