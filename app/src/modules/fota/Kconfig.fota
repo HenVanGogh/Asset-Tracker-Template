@@ -21,15 +21,14 @@ config APP_FOTA_URL_MAX_LEN
 
 config APP_FOTA_SEC_TAG
 	int "Default TLS security tag for FOTA downloads"
-	default -1
+	default 16842754
 	help
-	  Set to -1 to disable TLS certificate verification (plain HTTP or
-	  unverified HTTPS — development only).
-	  Set to a provisioned modem sec_tag (>= 0) to enable TLS certificate
-	  verification for HTTPS downloads.
-	  The CA certificate must be provisioned at this tag using AT%CMNG
-	  before the FOTA update is triggered.
-	  The MQTT command can override this value per-request.
+	  Modem credential store tag used for TLS certificate verification.
+	  Default 16842754 (0x01010002) — provision ISRG Root X1 (Let's Encrypt)
+	  at this tag with: AT%CMNG=0,16842754,0,"<PEM>"
+	  See docs/FOTA_PROVISIONING.md for the full provisioning procedure.
+	  Set to -1 to skip verification (plain HTTP / dev-only).
+	  The MQTT fota_start command can override this value per-request.
 
 config APP_FOTA_THREAD_STACK_SIZE
 	int "Thread stack size"

@@ -1,0 +1,84 @@
+# Static Partition Manager layout for Thingy:91X (nRF9151 NS)
+#
+# WARNING: Do NOT modify addresses or sizes without reflashing the device
+# with a full JLink hex (merged.hex). FOTA writes to mcuboot_secondary and
+# MCUboot swaps at mcuboot_primary — both must match exactly.
+#
+# FOTA update file : app/build/dfu_application.zip
+# First full flash : app/build/merged.hex  (via JLink / nrfutil device program)
+# Subsequent OTA   : MQTT {"command":"fota_start","url":"https://t4as.org/..."}
+#
+# Internal flash (1 MB, 0x00000-0xFFFFF)
+# ----------------------------------------
+# 0x00000  b0 / NSIB        32 KB  secure boot
+# 0x08000  s0 (mcuboot)     80 KB  primary MCUboot slot
+# 0x1C000  s1 (mcuboot)     80 KB  redundant MCUboot slot
+# 0x30000  mcuboot_primary 832 KB  pad(0x200) + TF-M(0x7E00) + app(0xC8000)
+#
+# External flash (32 MB, 0x000000-0x1FFFFFF on QSPI)
+# ----------------------------------------
+# 0x000000 mcuboot_secondary 832 KB  OTA staging (must == primary size)
+# 0x0D0000 fmfu_storage        4 MB  full modem FW update
+# 0x4D0000 settings_storage    8 KB  Zephyr settings / NVS
+
+# --- Internal flash ---
+
+b0:
+  address: 0x0
+  region: flash_primary
+  size: 0x8000
+
+mcuboot:
+  address: 0x8200
+  region: flash_primary
+  size: 0x13e00
+
+s0_pad:
+  address: 0x8000
+  region: flash_primary
+  size: 0x200
+
+s1_pad:
+  address: 0x1c000
+  region: flash_primary
+  size: 0x200
+
+s1_image:
+  address: 0x1c200
+  region: flash_primary
+  size: 0x13e00
+
+mcuboot_pad:
+  address: 0x30000
+  region: flash_primary
+  size: 0x200
+
+tfm:
+  address: 0x30200
+  region: flash_primary
+  size: 0x7e00
+
+app:
+  address: 0x38000
+  region: flash_primary
+  size: 0xc8000
+
+# --- External flash (QSPI) ---
+
+mcuboot_secondary:
+  address: 0x0
+  device: DT_CHOSEN(nordic_pm_ext_flash)
+  region: external_flash
+  size: 0xd0000
+
+fmfu_storage:
+  address: 0xd0000
+  device: DT_CHOSEN(nordic_pm_ext_flash)
+  region: external_flash
+  size: 0x400000
+
+settings_storage:
+  address: 0x4d0000
+  device: DT_CHOSEN(nordic_pm_ext_flash)
+  region: external_flash
+  size: 0x2000
