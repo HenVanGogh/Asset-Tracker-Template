@@ -107,28 +107,34 @@ static void parse_url(const char *url,
 		      char *host_buf, size_t host_sz,
 		      char *file_buf, size_t file_sz)
 {
-	const char *p = strstr(url, "://");
+	/* Find start of host portion (after "://") */
+	const char *scheme_end = strstr(url, "://");
+	const char *host_start = scheme_end ? scheme_end + 3 : url;
 
-	p = p ? p + 3 : url;
-
-	const char *slash = strchr(p, '/');
+	/* Find first '/' after the host */
+	const char *slash = strchr(host_start, '/');
 
 	if (slash) {
-		size_t hlen = MIN((size_t)(slash - p), host_sz - 1);
+		/*
+		 * host_buf = scheme + host, e.g. "https://t4as.org"
+		 * The downloader constructs the final URL as snprintf("%s/%s", host, file),
+		 * so host must include the scheme to avoid the "Protocol not specified" warning
+		 * and to select the right port automatically.
+		 */
+		size_t hlen = MIN((size_t)(slash - url), host_sz - 1);
 
-		strncpy(host_buf, p, hlen);
+		strncpy(host_buf, url, hlen);
 		host_buf[hlen] = '\0';
-		/* Skip the leading '/' — downloader adds its own separator:
-		 * downloader_get_with_host_and_file() does snprintf("%s/%s", host, file)
-		 * so passing "/path" would produce "host//path".
+		/* file = path without leading '/': "thingyupdate" (not "/thingyupdate")
+		 * because the downloader adds its own '/' separator.
 		 */
 		strncpy(file_buf, slash + 1, file_sz - 1);
 		file_buf[file_sz - 1] = '\0';
 	} else {
-		strncpy(host_buf, p, host_sz - 1);
+		/* No path — use whole URL as host */
+		strncpy(host_buf, url, host_sz - 1);
 		host_buf[host_sz - 1] = '\0';
-		strncpy(file_buf, "/", file_sz - 1);
-		file_buf[file_sz - 1] = '\0';
+		file_buf[0] = '\0';
 	}
 }
 
