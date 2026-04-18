@@ -133,7 +133,7 @@ When integrated with the custom MQTT module, sensor data is published as JSON:
 
 ```json
 {
-  "device_id": "thingy91x-asset-tracker",
+  "device_id": "gateway_XXXX",
   "type": "uart_sensor",
   "sequence": 42,
   "timestamp": 1234567890,

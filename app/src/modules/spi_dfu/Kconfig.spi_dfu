@@ -1,0 +1,24 @@
+#
+# Copyright (c) 2025 Nordic Semiconductor ASA
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+menuconfig APP_SPI_DFU
+	bool "SPI DFU Transport — push firmware to nRF5340 over SPI"
+	default y if APP_EXT_DFU && APP_UART_SENSOR
+	depends on APP_EXT_DFU
+	depends on APP_UART_SENSOR
+	depends on FLASH
+	depends on FLASH_MAP
+	help
+	  Send downloaded companion-chip firmware to the nRF5340 over
+	  the SPI inter-chip link using MCUmgr SMP protocol.
+
+if APP_SPI_DFU
+
+module = APP_SPI_DFU
+module-str = SPI_DFU
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # APP_SPI_DFU

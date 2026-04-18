@@ -144,6 +144,105 @@ int uart_sensor_set_debug_echo(bool enable)
 	return 0;
 }
 
+/* ---- Sensor whitelist management (forwarded to nRF5340 gateway) ---- */
+
+int uart_sensor_mgmt_command(const char *cmd)
+{
+	if (!cmd) {
+		return -EINVAL;
+	}
+	/* If caller already prefixed "sensor_mgmt", send as-is */
+	if (strncmp(cmd, "sensor_mgmt ", 12) == 0) {
+		return uart_sensor_send_command(cmd);
+	}
+	char buf[UART_LINE_BUF_SIZE];
+	int n = snprintf(buf, sizeof(buf), "sensor_mgmt %s", cmd);
+
+	if (n < 0 || n >= (int)sizeof(buf)) {
+		return -ENOMEM;
+	}
+	return uart_sensor_send_command(buf);
+}
+
+int uart_sensor_mgmt_status(void)
+{
+	return uart_sensor_send_command("sensor_mgmt status");
+}
+
+int uart_sensor_mgmt_set_mode(const char *mode)
+{
+	if (!mode) {
+		return -EINVAL;
+	}
+	char buf[64];
+
+	snprintf(buf, sizeof(buf), "sensor_mgmt mode %s", mode);
+	return uart_sensor_send_command(buf);
+}
+
+int uart_sensor_mgmt_add(const char *ble_addr)
+{
+	if (!ble_addr) {
+		return -EINVAL;
+	}
+	char buf[64];
+
+	snprintf(buf, sizeof(buf), "sensor_mgmt add %s", ble_addr);
+	return uart_sensor_send_command(buf);
+}
+
+int uart_sensor_mgmt_remove(const char *ble_addr)
+{
+	if (!ble_addr) {
+		return -EINVAL;
+	}
+	char buf[64];
+
+	snprintf(buf, sizeof(buf), "sensor_mgmt remove %s", ble_addr);
+	return uart_sensor_send_command(buf);
+}
+
+int uart_sensor_mgmt_list(void)
+{
+	return uart_sensor_send_command("sensor_mgmt list");
+}
+
+int uart_sensor_mgmt_clear(void)
+{
+	return uart_sensor_send_command("sensor_mgmt clear");
+}
+
+int uart_sensor_mgmt_provision_done(void)
+{
+	return uart_sensor_send_command("sensor_mgmt provision_done");
+}
+
+int uart_sensor_mgmt_set_key(const char *ble_addr, const char *hex_key)
+{
+	if (!ble_addr || !hex_key) {
+		return -EINVAL;
+	}
+	char buf[UART_LINE_BUF_SIZE];
+	int n = snprintf(buf, sizeof(buf), "sensor_mgmt set_key %s %s",
+			 ble_addr, hex_key);
+
+	if (n < 0 || n >= (int)sizeof(buf)) {
+		return -ENOMEM;
+	}
+	return uart_sensor_send_command(buf);
+}
+
+int uart_sensor_mgmt_get_key(const char *ble_addr)
+{
+	if (!ble_addr) {
+		return -EINVAL;
+	}
+	char buf[64];
+
+	snprintf(buf, sizeof(buf), "sensor_mgmt get_key %s", ble_addr);
+	return uart_sensor_send_command(buf);
+}
+
 /* Startup sequencing work */
 static struct k_work_delayable esl_startup_work;
 static int esl_startup_step;
@@ -481,6 +580,45 @@ int uart_sensor_send_command(const char *cmd)
 	}
 
 	return 0;
+}
+
+/* ===========================================================================
+ * Low-level SPI bus access — used by spi_dfu module for DFU transport
+ * =========================================================================== */
+
+int uart_sensor_spi_lock(k_timeout_t timeout)
+{
+	return k_mutex_lock(&spi_bus_mutex, timeout);
+}
+
+void uart_sensor_spi_unlock(void)
+{
+	k_mutex_unlock(&spi_bus_mutex);
+}
+
+int uart_sensor_spi_xfer_locked(const uint8_t *tx, uint8_t *rx)
+{
+	if (!tx || !rx) {
+		return -EINVAL;
+	}
+
+	const struct spi_buf     tx_buf = { .buf = (void *)tx,
+					    .len = SPI_FRAME_SIZE };
+	const struct spi_buf     rx_buf = { .buf = rx,
+					    .len = SPI_FRAME_SIZE };
+	const struct spi_buf_set tx_set = { .buffers = &tx_buf, .count = 1 };
+	const struct spi_buf_set rx_set = { .buffers = &rx_buf, .count = 1 };
+
+	gpio_pin_set_dt(&esl_cs_gpio, 1);  /* Assert CS */
+	int ret = spi_transceive(spi_dev, &spi_cfg, &tx_set, &rx_set);
+	gpio_pin_set_dt(&esl_cs_gpio, 0);  /* Deassert CS */
+
+	return ret;
+}
+
+bool uart_sensor_spi_drdy_active(void)
+{
+	return gpio_pin_get_dt(&esl_drdy_gpio) > 0;
 }
 
 /* Convenience: send "esl_c <subcmd>" */
@@ -1251,6 +1389,52 @@ int uart_sensor_process_data_line(const char *data)
 		return 0;
 	}
 
+	/* ---- Sensor whitelist management events ---- */
+
+	/* #SENSOR_MGMT:STATUS,MODE=<mode>,COUNT=<n>,PROVISIONED=<0|1>
+	 * #SENSOR_MGMT:ADDED=<addr>,COUNT=<n>
+	 * #SENSOR_MGMT:REMOVED=<addr>,COUNT=<n>
+	 * #SENSOR_MGMT:CLEARED
+	 * #SENSOR_MGMT:MODE=<mode>
+	 * #SENSOR_MGMT:PROVISIONED,COUNT=<n>,MODE=<mode>
+	 * #SENSOR_MGMT:ENTRY=<idx>,<addr>
+	 * #SENSOR_MGMT:LIST_DONE,COUNT=<n>
+	 * #SENSOR_MGMT:KEY_SET=<addr>
+	 */
+	if (strncmp(data, "#SENSOR_MGMT:", 13) == 0) {
+		const char *evt = data + 13;
+
+		LOG_INF("Sensor mgmt event: %s", evt);
+
+		/* Publish to MQTT via zbus using response_text */
+		struct uart_sensor_msg mgmt_msg = {
+			.type      = UART_SENSOR_SENSOR_MGMT_EVENT,
+			.timestamp = k_uptime_get(),
+		};
+		strncpy(mgmt_msg.response_text, evt,
+			sizeof(mgmt_msg.response_text) - 1);
+		zbus_chan_pub(&UART_SENSOR_CHAN, &mgmt_msg,
+			      K_MSEC(UART_ZBUS_TIMEOUT_MS));
+		return 0;
+	}
+
+	/* #SENSOR_BLOCKED:<addr>,reason=not_in_whitelist */
+	if (strncmp(data, "#SENSOR_BLOCKED:", 16) == 0) {
+		const char *body = data + 16;
+
+		LOG_INF("Sensor blocked: %s", body);
+
+		struct uart_sensor_msg blk_msg = {
+			.type      = UART_SENSOR_SENSOR_BLOCKED,
+			.timestamp = k_uptime_get(),
+		};
+		strncpy(blk_msg.response_text, body,
+			sizeof(blk_msg.response_text) - 1);
+		zbus_chan_pub(&UART_SENSOR_CHAN, &blk_msg,
+			      K_MSEC(UART_ZBUS_TIMEOUT_MS));
+		return 0;
+	}
+
 	/* #PAST_FAIL / #PAST_FALLBACK */
 	if (strncmp(data, "#PAST_FAIL:", 11) == 0 ||
 	    strncmp(data, "#PAST_FALLBACK", 14) == 0 ||
@@ -1415,6 +1599,8 @@ static void esl_startup_work_fn(struct k_work *work)
 		if (tag_count > 0) {
 			uart_sensor_esl_command("nus get_name");
 		}
+		/* Query sensor whitelist status from gateway */
+		uart_sensor_mgmt_status();
 		break;
 
 	default:

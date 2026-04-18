@@ -22,8 +22,8 @@ command published to the device's command topic.
 ## Device-Side Contract
 
 ### MQTT Topics (existing, do not change)
-- **Data topic** (device → broker): `gateway/thingy91x-asset-tracker/data`
-- **Command topic** (server → device): `gateway/thingy91x-asset-tracker/command`
+- **Data topic** (device → broker): `gateway/gateway_XXXX/data`
+- **Command topic** (server → device): `gateway/gateway_XXXX/command`
 
 ### MQTT FOTA Commands
 All commands are JSON, published to the command topic.
@@ -66,78 +66,84 @@ a plain HTTP GET to `https://<host><path>`.
 
 ## KNOWN SERVER BUG (must fix before FOTA works)
 
-**Verified April 2 2026** — both `http://t4as.org/thingyupdate` and
-`https://t4as.org/thingyupdate` currently redirect to:
-```
-http://t4as.org:443/thingyupdate/
-```
-This URL is **wrong in three ways**:
-1. Scheme is `http://` but port is 443 — the device connects plaintext to a
-   TLS port and receives HTTP 400 Bad Request
-2. A trailing slash was added to the path (`/thingyupdate/` ≠ `/thingyupdate`)
-3. This is a redirect at all — redirects are not followed correctly
+**Verified April 2 2026** — `https://t4as.org/thingyupdate` redirects 301 to
+`https://t4as.org/thingyupdate/` (trailing slash). That URL returns `200 OK`
+but serves `Content-Type: text/html` with no `Content-Length` header — it is
+an nginx directory listing page, not the firmware binary.
 
-**Root cause**: the HTTP→HTTPS redirect rule in nginx (or equivalent) is
-emitting `http://` with port 443 in the `Location` header instead of `https://`
-without an explicit port.
+The nRF9151 downloader aborts with `File size not set` when `Content-Length`
+is missing (required for MCUboot DFU target size allocation).
 
-**Fix required in the web server config**:
+**Root cause**: nginx treats `/thingyupdate` as a directory name and auto-
+redirects to the trailing-slash form, then serves an HTML index of the
+directory. The `app_update.bin` file is likely placed inside a folder named
+`thingyupdate/` on the server instead of being served directly as the
+`/thingyupdate` path.
 
-nginx example (broken):
+**Fixes (pick one)**:
+
+### Fix A — nginx exact-match location (recommended)
 ```nginx
-# WRONG — produces Location: http://t4as.org:443/...
-server {
-    listen 80;
-    return 301 http://$host:443$request_uri;  # ← wrong scheme + explicit port
-}
-```
-
-nginx fix:
-```nginx
-# CORRECT
-server {
-    listen 80;
-    server_name t4as.org;
-    return 301 https://$host$request_uri;     # ← https, no port
-}
-
 server {
     listen 443 ssl;
     server_name t4as.org;
     ssl_certificate     /etc/letsencrypt/live/t4as.org/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/t4as.org/privkey.pem;
 
+    # Exact match — no trailing slash redirect, serves binary directly
     location = /thingyupdate {
         alias /var/www/fota/app_update.bin;
         add_header Content-Type application/octet-stream;
         add_header Content-Disposition "attachment; filename=app_update.bin";
     }
 }
+server {
+    listen 80;
+    server_name t4as.org;
+    return 301 https://$host$request_uri;
+}
 ```
 
-Caddy fix (auto-TLS, simplest option):
+Note: `location =` (exact match) does NOT redirect to a trailing slash.
+`location /thingyupdate` (prefix match) would auto-redirect to `/thingyupdate/`.
+
+### Fix B — use a `.bin` extension in the URL
+Place `app_update.bin` at `/var/www/html/thingyupdate.bin` and use:
+```json
+{"command": "fota_start", "url": "https://t4as.org/thingyupdate.bin"}
+```
+nginx serves files with extensions directly without the trailing-slash redirect.
+
+### Fix C — Caddy (simplest, handles TLS automatically)
+Replace nginx with Caddy:
 ```caddyfile
 t4as.org {
-    route /thingyupdate {
-        file_server {
-            root /var/www/fota
-            index app_update.bin
-        }
+    handle /thingyupdate {
+        respond * "not found" 404
+    }
+    file_server /thingyupdate {
+        root /var/www/fota
+        index app_update.bin
     }
 }
 ```
 
 **After fixing, verify with curl before sending the MQTT command**:
 ```bash
-# Must return 200 with binary content, no redirects:
-curl -v --no-location https://t4as.org/thingyupdate -o /dev/null
-# Check: < HTTP/1.1 200 OK
-# Check: < Content-Type: application/octet-stream
-# Check: NO 3xx response lines
+# All three must pass:
 
-# Check file size matches the build artifact:
-curl -sI https://t4as.org/thingyupdate | grep -i content-length
-wc -c app/build/app_update.bin   # sizes must match
+# 1. No redirect (must be 200, not 301)
+curl -sv --no-location https://t4as.org/thingyupdate -o /tmp/fw.bin 2>&1 | grep "< HTTP"
+#    Expected: < HTTP/2 200
+
+# 2. Content-Type is binary, Content-Length is set
+curl -sI https://t4as.org/thingyupdate | grep -iE "content-type|content-length"
+#    Expected: content-type: application/octet-stream
+#    Expected: content-length: <size in bytes>
+
+# 3. File size matches build artifact
+wc -c /tmp/fw.bin
+wc -c /path/to/app_update.bin   # must match
 ```
 
 ## Firmware Artifact
@@ -171,7 +177,7 @@ Implement a minimal server with these components. Keep it simple and stateless.
 If you add a CI/CD trigger or web UI for publishing updates:
 - Connect to MQTT broker at `217.154.155.83:1883`
 - Username: `mqttuser`, Password: `mqttuser`
-- Publish `fota_start` command to `gateway/thingy91x-asset-tracker/command`
+- Publish `fota_start` command to `gateway/gateway_XXXX/command`
 
 ### 3. OTA Workflow Automation (optional)
 Script that:

@@ -1,0 +1,24 @@
+#
+# Copyright (c) 2024 Nordic Semiconductor
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+menuconfig APP_EXT_DFU
+	bool "External DFU — download companion-chip firmware to flash"
+	default y if APP_FOTA
+	depends on DOWNLOADER
+	depends on FLASH
+	depends on FLASH_MAP
+	help
+	  Download nRF5340 and nRF52840 firmware images via HTTP/HTTPS and
+	  store them in dedicated slots on external QSPI flash.  The images
+	  can later be forwarded to the target chip over SPI.
+
+if APP_EXT_DFU
+
+module = APP_EXT_DFU
+module-str = EXT_DFU
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # APP_EXT_DFU

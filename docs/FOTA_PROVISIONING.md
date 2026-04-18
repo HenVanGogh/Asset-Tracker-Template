@@ -36,7 +36,7 @@ After the first flash the device can receive all future updates wirelessly.
 
 ## 2. TLS Certificate Provisioning
 
-FOTA downloads from `https://t4as.org/` which is served via Let's Encrypt.
+FOTA downloads from `https://webs.org/` which is served via Let's Encrypt.
 The modem needs the **ISRG Root X1** CA certificate at security tag `16842754`.
 
 ### Step 1 — Connect to RTT shell
@@ -118,12 +118,12 @@ A non-empty response confirms the cert is stored.
 Once cert is provisioned, publish to the device command topic:
 
 ```json
-{"command": "fota_start", "url": "https://t4as.org/thingyupdate"}
+{"command": "fota_start", "url": "https://webs.org/thingyupdate"}
 ```
 
 Optional overrides:
 ```json
-{"command": "fota_start", "url": "https://t4as.org/v2/firmware.bin", "sec_tag": 16842754}
+{"command": "fota_start", "url": "https://webs.org/v2/firmware.bin", "sec_tag": 16842754}
 ```
 
 Monitor with:
@@ -147,7 +147,7 @@ The device will:
 
 ## 4. FOTA update file
 
-The file to serve at `https://t4as.org/thingyupdate`:
+The file to serve at `https://webs.org/thingyupdate`:
 
 ```
 app/build/dfu_application.zip
@@ -165,7 +165,7 @@ Serve `app_update.bin` (extracted from `dfu_application.zip`) directly:
 ```bash
 cd app/build
 unzip -o dfu_application.zip
-# Now serve app_update.bin at https://t4as.org/thingyupdate
+# Now serve app_update.bin at https://webs.org/thingyupdate
 ```
 
 ---

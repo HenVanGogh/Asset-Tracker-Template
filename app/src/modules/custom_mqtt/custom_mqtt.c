@@ -15,11 +15,15 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/settings/settings.h>
+#include <zephyr/random/random.h>
 #include <cJSON.h>
 #include <date_time.h>
 #include <arpa/inet.h>
 #include <math.h>
 #include <zephyr/app_version.h>
+#if defined(CONFIG_MCUBOOT_IMG_MANAGER)
+#include <zephyr/dfu/mcuboot.h>
+#endif
 
 #include "custom_mqtt.h"
 #include "custom_mqtt_config.h"
@@ -44,6 +48,12 @@
 #include "uart_sensor.h"
 #if defined(CONFIG_APP_FOTA)
 #include "fota.h"
+#endif
+#if defined(CONFIG_APP_EXT_DFU)
+#include "ext_dfu.h"
+#endif
+#if defined(CONFIG_APP_SPI_DFU)
+#include "spi_dfu.h"
 #endif
 #endif
 
@@ -151,6 +161,9 @@ static struct k_work_delayable mqtt_inactivity_work;
 static int64_t last_mqtt_activity_ms;    /* k_uptime_get() of last MQTT I/O */
 static bool mqtt_inactive_reboot_flag;   /* set before reboot, cleared after reporting */
 
+/* Device name generation — set on first boot, persisted in settings */
+static bool name_generated;
+
 /* ---- Zephyr Settings handlers ---- */
 
 /* MQTT config settings: app/mqtt/{host,port,user,pass,client_id} */
@@ -208,6 +221,11 @@ static int app_mqtt_settings_set(const char *key, size_t len,
 		uint8_t v;
 		if (read_cb(cb_arg, &v, sizeof(v)) == sizeof(v)) {
 			mqtt_rt_cfg.power_mode = (v == 1) ? POWER_MODE_HIGH : POWER_MODE_NORMAL;
+		}
+	} else if (strcmp(key, "name_init") == 0) {
+		uint8_t v;
+		if (read_cb(cb_arg, &v, sizeof(v)) == sizeof(v)) {
+			name_generated = (v != 0);
 		}
 	}
 	return 0;
@@ -461,6 +479,16 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 				/* Parse command if it's JSON */
 				cJSON *received_json = cJSON_Parse((char *)mqtt_ctx.payload_buf);
 				if (received_json) {
+					/* Echo request id for message correlation (optional field) */
+					cJSON *req_id = cJSON_GetObjectItem(received_json, "id");
+					if (req_id) {
+						if (cJSON_IsNumber(req_id)) {
+							cJSON_AddNumberToObject(response, "id", req_id->valueint);
+						} else if (cJSON_IsString(req_id)) {
+							cJSON_AddStringToObject(response, "id", req_id->valuestring);
+						}
+					}
+
 					/* Check for "type": "uart_passthrough" format first */
 					cJSON *type = cJSON_GetObjectItem(received_json, "type");
 					cJSON *command = cJSON_GetObjectItem(received_json, "command");
@@ -806,6 +834,134 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 								cJSON_AddNumberToObject(response, "error_code", ret);
 							}
 
+						/* ---- Sensor Whitelist Management Commands ---- */
+
+						} else if (strcmp(command->valuestring, "sensor_mgmt_status") == 0) {
+							int ret = uart_sensor_mgmt_status();
+							if (ret == 0) {
+								cJSON_AddStringToObject(response, "status", "sensor_mgmt_status_requested");
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddNumberToObject(response, "error_code", ret);
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_mgmt_mode") == 0) {
+							cJSON *mode = cJSON_GetObjectItem(received_json, "mode");
+							if (mode && cJSON_IsString(mode) &&
+							    (strcmp(mode->valuestring, "whitelist") == 0 ||
+							     strcmp(mode->valuestring, "open") == 0)) {
+								int ret = uart_sensor_mgmt_set_mode(mode->valuestring);
+								if (ret == 0) {
+									cJSON_AddStringToObject(response, "status", "ok");
+									cJSON_AddStringToObject(response, "mode", mode->valuestring);
+								} else {
+									cJSON_AddStringToObject(response, "status", "error");
+									cJSON_AddNumberToObject(response, "error_code", ret);
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_mode");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"sensor_mgmt_mode\",\"mode\":\"whitelist\"}");
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_mgmt_add") == 0) {
+							cJSON *addr = cJSON_GetObjectItem(received_json, "addr");
+							if (addr && cJSON_IsString(addr)) {
+								int ret = uart_sensor_mgmt_add(addr->valuestring);
+								if (ret == 0) {
+									cJSON_AddStringToObject(response, "status", "ok");
+									cJSON_AddStringToObject(response, "addr", addr->valuestring);
+								} else {
+									cJSON_AddStringToObject(response, "status", "error");
+									cJSON_AddNumberToObject(response, "error_code", ret);
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_addr");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"sensor_mgmt_add\",\"addr\":\"AA:BB:CC:DD:EE:FF\"}");
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_mgmt_remove") == 0) {
+							cJSON *addr = cJSON_GetObjectItem(received_json, "addr");
+							if (addr && cJSON_IsString(addr)) {
+								int ret = uart_sensor_mgmt_remove(addr->valuestring);
+								if (ret == 0) {
+									cJSON_AddStringToObject(response, "status", "ok");
+									cJSON_AddStringToObject(response, "addr", addr->valuestring);
+								} else {
+									cJSON_AddStringToObject(response, "status", "error");
+									cJSON_AddNumberToObject(response, "error_code", ret);
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_addr");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"sensor_mgmt_remove\",\"addr\":\"AA:BB:CC:DD:EE:FF\"}");
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_mgmt_list") == 0) {
+							int ret = uart_sensor_mgmt_list();
+							if (ret == 0) {
+								cJSON_AddStringToObject(response, "status", "sensor_mgmt_list_requested");
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddNumberToObject(response, "error_code", ret);
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_mgmt_clear") == 0) {
+							int ret = uart_sensor_mgmt_clear();
+							if (ret == 0) {
+								cJSON_AddStringToObject(response, "status", "sensor_mgmt_cleared");
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddNumberToObject(response, "error_code", ret);
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_mgmt_provision_done") == 0) {
+							int ret = uart_sensor_mgmt_provision_done();
+							if (ret == 0) {
+								cJSON_AddStringToObject(response, "status", "ok");
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddNumberToObject(response, "error_code", ret);
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_mgmt_set_key") == 0) {
+							cJSON *addr = cJSON_GetObjectItem(received_json, "addr");
+							cJSON *key = cJSON_GetObjectItem(received_json, "key");
+							if (addr && cJSON_IsString(addr) &&
+							    key && cJSON_IsString(key)) {
+								int ret = uart_sensor_mgmt_set_key(
+									addr->valuestring, key->valuestring);
+								if (ret == 0) {
+									cJSON_AddStringToObject(response, "status", "ok");
+									cJSON_AddStringToObject(response, "addr", addr->valuestring);
+								} else {
+									cJSON_AddStringToObject(response, "status", "error");
+									cJSON_AddNumberToObject(response, "error_code", ret);
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_params");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"sensor_mgmt_set_key\",\"addr\":\"AA:BB:CC:DD:EE:FF\",\"key\":\"0102...\"}");
+							}
+
+						} else if (strcmp(command->valuestring, "sensor_mgmt_get_key") == 0) {
+							cJSON *addr = cJSON_GetObjectItem(received_json, "addr");
+							if (addr && cJSON_IsString(addr)) {
+								int ret = uart_sensor_mgmt_get_key(addr->valuestring);
+								if (ret == 0) {
+									cJSON_AddStringToObject(response, "status", "ok");
+									cJSON_AddStringToObject(response, "addr", addr->valuestring);
+								} else {
+									cJSON_AddStringToObject(response, "status", "error");
+									cJSON_AddNumberToObject(response, "error_code", ret);
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_addr");
+								cJSON_AddStringToObject(response, "hint",
+									"{\"command\":\"sensor_mgmt_get_key\",\"addr\":\"AA:BB:CC:DD:EE:FF\"}");
+							}
+
 #endif /* CONFIG_APP_UART_SENSOR */
 
 						} else if (strcmp(command->valuestring, "mqtt_get_config") == 0) {
@@ -844,12 +1000,8 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 								cJSON_AddStringToObject(response, "status", "saved");
 								cJSON_AddStringToObject(response, "host", mqtt_rt_cfg.host);
 								cJSON_AddNumberToObject(response, "port", mqtt_rt_cfg.port);
-								cJSON_AddStringToObject(response, "note",
-									"Send mqtt_restart to reconnect with new broker");
 							} else {
 								cJSON_AddStringToObject(response, "status", "no_changes");
-								cJSON_AddStringToObject(response, "hint",
-									"{\"command\":\"mqtt_set_broker\",\"host\":\"192.168.1.1\",\"port\":1883}");
 							}
 
 						} else if (strcmp(command->valuestring, "mqtt_set_auth") == 0) {
@@ -872,12 +1024,8 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 							}
 							if (changed) {
 								cJSON_AddStringToObject(response, "status", "saved");
-								cJSON_AddStringToObject(response, "note",
-									"Send mqtt_restart to reconnect with new credentials");
 							} else {
 								cJSON_AddStringToObject(response, "status", "no_changes");
-								cJSON_AddStringToObject(response, "hint",
-									"{\"command\":\"mqtt_set_auth\",\"username\":\"user\",\"password\":\"pass\"}");
 							}
 
 						} else if (strcmp(command->valuestring, "mqtt_set_client_id") == 0) {
@@ -889,12 +1037,8 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 										  strlen(mqtt_rt_cfg.client_id));
 								cJSON_AddStringToObject(response, "status", "saved");
 								cJSON_AddStringToObject(response, "client_id", mqtt_rt_cfg.client_id);
-								cJSON_AddStringToObject(response, "note",
-									"Send mqtt_restart to reconnect with new client ID");
 							} else {
 								cJSON_AddStringToObject(response, "status", "missing_id");
-								cJSON_AddStringToObject(response, "hint",
-									"{\"command\":\"mqtt_set_client_id\",\"id\":\"my_device\"}");
 							}
 
 						} else if (strcmp(command->valuestring, "mqtt_restart") == 0) {
@@ -926,12 +1070,8 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 								cJSON_AddStringToObject(response, "status", "saved");
 								cJSON_AddStringToObject(response, "pub_topic", mqtt_rt_cfg.pub_topic);
 								cJSON_AddStringToObject(response, "sub_topic", mqtt_rt_cfg.sub_topic);
-								cJSON_AddStringToObject(response, "note",
-									"Send mqtt_restart to reconnect with new topics");
 							} else {
 								cJSON_AddStringToObject(response, "status", "no_changes");
-								cJSON_AddStringToObject(response, "hint",
-									"{\"command\":\"mqtt_set_topics\",\"pub_topic\":\"gw/dev1/data\",\"sub_topic\":\"gw/dev1/cmd\"}");
 							}
 
 						} else if (strcmp(command->valuestring, "mqtt_set_tls") == 0) {
@@ -950,8 +1090,6 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 							cJSON_AddStringToObject(response, "status", "saved");
 							cJSON_AddBoolToObject(response, "tls_enabled", mqtt_rt_cfg.tls_enabled);
 							cJSON_AddNumberToObject(response, "sec_tag", mqtt_rt_cfg.sec_tag);
-							cJSON_AddStringToObject(response, "note",
-								"Send mqtt_restart to reconnect with new TLS settings");
 
 						} else if (strcmp(command->valuestring, "set_power_mode") == 0) {
 							cJSON *mode_j = cJSON_GetObjectItem(received_json, "mode");
@@ -987,6 +1125,214 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 									"{\"command\":\"set_power_mode\",\"mode\":\"high\"}");
 							}
 
+						} else if (strcmp(command->valuestring, "reboot") == 0) {
+							/* Reboot the device after publishing the acknowledgment.
+							 * Optional: "delay_s" — seconds to wait before reboot (default: 3).
+							 * Example: {"command":"reboot"}
+							 *          {"command":"reboot","delay_s":5} */
+							cJSON *delay_j = cJSON_GetObjectItem(received_json, "delay_s");
+							int delay_s = 3;
+							if (delay_j && cJSON_IsNumber(delay_j)) {
+								delay_s = CLAMP(delay_j->valueint, 1, 60);
+							}
+							cJSON_AddStringToObject(response, "status", "rebooting");
+							cJSON_AddNumberToObject(response, "delay_s", delay_s);
+							LOG_WRN("Reboot requested via MQTT, rebooting in %d s", delay_s);
+							/* Publish the ACK, then reboot after the delay */
+							char *reboot_resp = cJSON_Print(response);
+							if (reboot_resp) {
+								mqtt_publish_data(reboot_resp, strlen(reboot_resp));
+								cJSON_free(reboot_resp);
+							}
+							cJSON_Delete(received_json);
+							cJSON_Delete(response);
+							k_sleep(K_SECONDS(delay_s));
+							LOG_PANIC();
+							sys_reboot(SYS_REBOOT_COLD);
+							goto publish_skip;
+
+#if defined(CONFIG_APP_EXT_DFU)
+						} else if (strcmp(command->valuestring, "ext_fota_nrf5340") == 0 ||
+							   strcmp(command->valuestring, "ext_fota_nrf52840") == 0) {
+							/* Download companion-chip firmware to external flash slot.
+							 * Required: "url" — full URL to firmware .bin
+							 * Optional: "sec_tag" — TLS credential tag (-1 = no TLS) */
+							enum ext_dfu_target tgt =
+								(strcmp(command->valuestring, "ext_fota_nrf5340") == 0)
+								? EXT_DFU_TARGET_NRF5340
+								: EXT_DFU_TARGET_NRF52840;
+							cJSON *url_j = cJSON_GetObjectItem(received_json, "url");
+							if (url_j && cJSON_IsString(url_j) && strlen(url_j->valuestring) > 0) {
+								cJSON *tag_j = cJSON_GetObjectItem(received_json, "sec_tag");
+								int sec_tag = -1;
+								if (tag_j && cJSON_IsNumber(tag_j)) {
+									sec_tag = tag_j->valueint;
+								}
+								int ret = ext_dfu_start(tgt, url_j->valuestring, sec_tag);
+								if (ret == 0) {
+									cJSON_AddStringToObject(response, "status", "downloading");
+									cJSON_AddStringToObject(response, "target",
+										tgt == EXT_DFU_TARGET_NRF5340 ? "nrf5340" : "nrf52840");
+									cJSON_AddStringToObject(response, "url", url_j->valuestring);
+									cJSON_AddNumberToObject(response, "sec_tag", sec_tag);
+								} else if (ret == -EBUSY) {
+									cJSON_AddStringToObject(response, "status", "busy");
+								} else {
+									cJSON_AddStringToObject(response, "status", "error");
+									cJSON_AddNumberToObject(response, "error_code", ret);
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_url");
+							}
+
+						} else if (strcmp(command->valuestring, "ext_fota_status") == 0) {
+							/* Get download status for one or both companion-chip slots */
+							cJSON_AddStringToObject(response, "status", "ok");
+							struct ext_dfu_status st;
+
+							ext_dfu_get_status(EXT_DFU_TARGET_NRF5340, &st);
+							cJSON *nrf53 = cJSON_AddObjectToObject(response, "nrf5340");
+							if (nrf53) {
+								const char *state_str;
+								switch (st.state) {
+								case EXT_DFU_STATE_IDLE:        state_str = "idle"; break;
+								case EXT_DFU_STATE_ERASING:     state_str = "erasing"; break;
+								case EXT_DFU_STATE_DOWNLOADING: state_str = "downloading"; break;
+								case EXT_DFU_STATE_DONE:        state_str = "done"; break;
+								case EXT_DFU_STATE_ERROR:       state_str = "error"; break;
+								default:                        state_str = "unknown"; break;
+								}
+								cJSON_AddStringToObject(nrf53, "state", state_str);
+								cJSON_AddNumberToObject(nrf53, "bytes_written", st.bytes_written);
+								cJSON_AddNumberToObject(nrf53, "slot_size", st.slot_size);
+								if (st.progress_pct >= 0) {
+									cJSON_AddNumberToObject(nrf53, "progress_pct", st.progress_pct);
+								}
+								if (st.error) {
+									cJSON_AddNumberToObject(nrf53, "error_code", st.error);
+								}
+							}
+
+							ext_dfu_get_status(EXT_DFU_TARGET_NRF52840, &st);
+							cJSON *nrf52 = cJSON_AddObjectToObject(response, "nrf52840");
+							if (nrf52) {
+								const char *state_str;
+								switch (st.state) {
+								case EXT_DFU_STATE_IDLE:        state_str = "idle"; break;
+								case EXT_DFU_STATE_ERASING:     state_str = "erasing"; break;
+								case EXT_DFU_STATE_DOWNLOADING: state_str = "downloading"; break;
+								case EXT_DFU_STATE_DONE:        state_str = "done"; break;
+								case EXT_DFU_STATE_ERROR:       state_str = "error"; break;
+								default:                        state_str = "unknown"; break;
+								}
+								cJSON_AddStringToObject(nrf52, "state", state_str);
+								cJSON_AddNumberToObject(nrf52, "bytes_written", st.bytes_written);
+								cJSON_AddNumberToObject(nrf52, "slot_size", st.slot_size);
+								if (st.progress_pct >= 0) {
+									cJSON_AddNumberToObject(nrf52, "progress_pct", st.progress_pct);
+								}
+								if (st.error) {
+									cJSON_AddNumberToObject(nrf52, "error_code", st.error);
+								}
+							}
+
+						} else if (strcmp(command->valuestring, "ext_fota_cancel") == 0) {
+							int ret = ext_dfu_cancel();
+							if (ret == 0) {
+								cJSON_AddStringToObject(response, "status", "cancel_requested");
+							} else if (ret == -EALREADY) {
+								cJSON_AddStringToObject(response, "status", "no_active_download");
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddNumberToObject(response, "error_code", ret);
+							}
+
+						} else if (strcmp(command->valuestring, "ext_fota_erase") == 0) {
+							/* Erase a companion-chip slot.  Required: "target" = "nrf5340"|"nrf52840" */
+							cJSON *tgt_j = cJSON_GetObjectItem(received_json, "target");
+							if (tgt_j && cJSON_IsString(tgt_j)) {
+								enum ext_dfu_target tgt;
+								if (strcmp(tgt_j->valuestring, "nrf5340") == 0) {
+									tgt = EXT_DFU_TARGET_NRF5340;
+								} else if (strcmp(tgt_j->valuestring, "nrf52840") == 0) {
+									tgt = EXT_DFU_TARGET_NRF52840;
+								} else {
+									cJSON_AddStringToObject(response, "status", "invalid_target");
+									goto ext_erase_done;
+								}
+								int ret = ext_dfu_erase(tgt);
+								if (ret == 0) {
+									cJSON_AddStringToObject(response, "status", "erased");
+									cJSON_AddStringToObject(response, "target", tgt_j->valuestring);
+								} else if (ret == -EBUSY) {
+									cJSON_AddStringToObject(response, "status", "busy");
+								} else {
+									cJSON_AddStringToObject(response, "status", "error");
+									cJSON_AddNumberToObject(response, "error_code", ret);
+								}
+							} else {
+								cJSON_AddStringToObject(response, "status", "missing_target");
+							}
+ext_erase_done:
+							; /* label requires a statement */
+#endif /* CONFIG_APP_EXT_DFU */
+
+#if defined(CONFIG_APP_SPI_DFU)
+						} else if (strcmp(command->valuestring, "spi_dfu_nrf5340") == 0) {
+							/* Start nRF5340 firmware update over SPI.
+							 * Reads firmware from nrf5340_dfu ext flash slot
+							 * (must have been downloaded via ext_fota_nrf5340 first). */
+							int ret = spi_dfu_start_nrf5340();
+							if (ret == 0) {
+								cJSON_AddStringToObject(response, "status", "started");
+							} else if (ret == -EBUSY) {
+								cJSON_AddStringToObject(response, "status", "busy");
+							} else if (ret == -ENOENT) {
+								cJSON_AddStringToObject(response, "status", "no_firmware");
+								cJSON_AddStringToObject(response, "hint",
+									"Download firmware first with ext_fota_nrf5340");
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddNumberToObject(response, "error_code", ret);
+							}
+
+						} else if (strcmp(command->valuestring, "spi_dfu_status") == 0) {
+							struct spi_dfu_status st;
+							spi_dfu_get_status(&st);
+							const char *state_str;
+							switch (st.state) {
+							case SPI_DFU_STATE_IDLE:      state_str = "idle"; break;
+							case SPI_DFU_STATE_UPLOADING: state_str = "uploading"; break;
+							case SPI_DFU_STATE_TESTING:   state_str = "testing"; break;
+							case SPI_DFU_STATE_RESETTING: state_str = "resetting"; break;
+							case SPI_DFU_STATE_DONE:      state_str = "done"; break;
+							case SPI_DFU_STATE_ERROR:     state_str = "error"; break;
+							default:                      state_str = "unknown"; break;
+							}
+							cJSON_AddStringToObject(response, "status", "ok");
+							cJSON_AddStringToObject(response, "state", state_str);
+							cJSON_AddNumberToObject(response, "bytes_uploaded", st.bytes_uploaded);
+							cJSON_AddNumberToObject(response, "image_size", st.image_size);
+							if (st.progress_pct >= 0) {
+								cJSON_AddNumberToObject(response, "progress_pct", st.progress_pct);
+							}
+							if (st.error_code) {
+								cJSON_AddNumberToObject(response, "error_code", st.error_code);
+								cJSON_AddStringToObject(response, "error_msg", st.error_msg);
+							}
+
+						} else if (strcmp(command->valuestring, "spi_dfu_cancel") == 0) {
+							int ret = spi_dfu_cancel();
+							if (ret == 0) {
+								cJSON_AddStringToObject(response, "status", "cancel_requested");
+							} else if (ret == -EALREADY) {
+								cJSON_AddStringToObject(response, "status", "no_active_dfu");
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddNumberToObject(response, "error_code", ret);
+							}
+#endif /* CONFIG_APP_SPI_DFU */
+
 #if defined(CONFIG_APP_FOTA)
 						} else if (strcmp(command->valuestring, "fota_start") == 0) {
 							/* Trigger HTTP/HTTPS firmware download.
@@ -1005,8 +1351,6 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 									cJSON_AddStringToObject(response, "status", "fota_starting");
 									cJSON_AddStringToObject(response, "url", url_j->valuestring);
 									cJSON_AddNumberToObject(response, "sec_tag", sec_tag);
-									cJSON_AddStringToObject(response, "note",
-										"Device will download and reboot to apply update");
 									LOG_INF("FOTA triggered via MQTT: %s (sec_tag=%d)",
 										url_j->valuestring, sec_tag);
 								} else {
@@ -1015,8 +1359,6 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 								}
 							} else {
 								cJSON_AddStringToObject(response, "status", "missing_url");
-								cJSON_AddStringToObject(response, "hint",
-									"{\"command\":\"fota_start\",\"url\":\"https://t4as.org/thingyupdate\"}");
 							}
 
 						} else if (strcmp(command->valuestring, "fota_cancel") == 0) {
@@ -1042,6 +1384,44 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 							}
 							cJSON_AddStringToObject(response, "version", APP_VERSION_STRING);
 #endif /* CONFIG_APP_FOTA */
+
+						} else if (strcmp(command->valuestring, "image_info") == 0) {
+							/* Report running firmware version and MCUboot slot state.
+							 * Useful to verify a FOTA update was applied successfully. */
+							cJSON_AddStringToObject(response, "status", "ok");
+							cJSON_AddStringToObject(response, "version", APP_VERSION_STRING);
+#if defined(CONFIG_MCUBOOT_IMG_MANAGER)
+							bool confirmed = boot_is_img_confirmed();
+							cJSON_AddBoolToObject(response, "confirmed", confirmed);
+							int swap = mcuboot_swap_type();
+							const char *swap_str;
+							switch (swap) {
+							case BOOT_SWAP_TYPE_NONE:   swap_str = "none";   break;
+							case BOOT_SWAP_TYPE_TEST:   swap_str = "test";   break;
+							case BOOT_SWAP_TYPE_PERM:   swap_str = "perm";   break;
+							case BOOT_SWAP_TYPE_REVERT: swap_str = "revert"; break;
+							case BOOT_SWAP_TYPE_FAIL:   swap_str = "fail";   break;
+							default:                    swap_str = "unknown"; break;
+							}
+							cJSON_AddStringToObject(response, "swap_type", swap_str);
+#endif
+
+						} else if (strcmp(command->valuestring, "image_confirm") == 0) {
+							/* Permanently confirm the currently running image so it
+							 * survives a reboot without reverting to the previous image.
+							 * Call this after verifying the FOTA update works correctly. */
+#if defined(CONFIG_MCUBOOT_IMG_MANAGER)
+							int err = boot_write_img_confirmed();
+							if (err == 0 || err == -EALREADY) {
+								cJSON_AddStringToObject(response, "status", "ok");
+							} else {
+								cJSON_AddStringToObject(response, "status", "error");
+								cJSON_AddNumberToObject(response, "error_code", err);
+							}
+							cJSON_AddStringToObject(response, "version", APP_VERSION_STRING);
+#else
+							cJSON_AddStringToObject(response, "status", "error");
+#endif
 
 						} else {
 							/* Unknown command — do NOT forward to UART blindly.
@@ -2039,6 +2419,31 @@ static void process_uart_sensor_data(const struct uart_sensor_msg *msg)
 
 	/* ---- ESL-specific events: publish structured data ---- */
 
+	/* Sensor whitelist management events — forwarded from nRF5340 */
+	if (msg->type == UART_SENSOR_SENSOR_MGMT_EVENT) {
+		LOG_INF("Sensor mgmt event: %s", msg->response_text);
+		cJSON *json = cJSON_CreateObject();
+		if (json) {
+			cJSON_AddStringToObject(json, "type", "sensor_mgmt");
+			cJSON_AddStringToObject(json, "event", msg->response_text);
+			safe_publish_json(json, "sensor_mgmt");
+			cJSON_Delete(json);
+		}
+		return;
+	}
+
+	if (msg->type == UART_SENSOR_SENSOR_BLOCKED) {
+		LOG_INF("Sensor blocked: %s", msg->response_text);
+		cJSON *json = cJSON_CreateObject();
+		if (json) {
+			cJSON_AddStringToObject(json, "type", "sensor_blocked");
+			cJSON_AddStringToObject(json, "details", msg->response_text);
+			safe_publish_json(json, "sensor_blocked");
+			cJSON_Delete(json);
+		}
+		return;
+	}
+
 	if (msg->type == UART_SENSOR_ESL_TAG_FOUND) {
 		LOG_INF("ESL tag discovered: %s", msg->probe_id);
 		cJSON *json = cJSON_CreateObject();
@@ -2439,6 +2844,30 @@ static int custom_mqtt_init(void)
 
 	/* Load persisted settings — overrides Kconfig defaults if previously saved */
 	settings_load();
+
+	/* On first boot, generate a unique device name: gateway_XXXX (random hex) */
+	if (!name_generated) {
+		uint32_t rand_val = sys_rand32_get();
+
+		snprintf(mqtt_rt_cfg.client_id, sizeof(mqtt_rt_cfg.client_id),
+			 "gateway_%04X", (uint16_t)(rand_val & 0xFFFF));
+		snprintf(mqtt_rt_cfg.pub_topic, sizeof(mqtt_rt_cfg.pub_topic),
+			 "gateway/%s/data", mqtt_rt_cfg.client_id);
+		snprintf(mqtt_rt_cfg.sub_topic, sizeof(mqtt_rt_cfg.sub_topic),
+			 "gateway/%s/command", mqtt_rt_cfg.client_id);
+
+		settings_save_one("app/mqtt/client_id",
+				  mqtt_rt_cfg.client_id, strlen(mqtt_rt_cfg.client_id));
+		settings_save_one("app/mqtt/pub_topic",
+				  mqtt_rt_cfg.pub_topic, strlen(mqtt_rt_cfg.pub_topic));
+		settings_save_one("app/mqtt/sub_topic",
+				  mqtt_rt_cfg.sub_topic, strlen(mqtt_rt_cfg.sub_topic));
+		uint8_t flag = 1;
+
+		settings_save_one("app/mqtt/name_init", &flag, sizeof(flag));
+		name_generated = true;
+		LOG_INF("Generated device name: %s", mqtt_rt_cfg.client_id);
+	}
 
 	LOG_INF("MQTT config: host=%s port=%u user=%s",
 		mqtt_rt_cfg.host, mqtt_rt_cfg.port, mqtt_rt_cfg.username);

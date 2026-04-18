@@ -96,6 +96,12 @@ enum uart_sensor_msg_type {
 	/** Sensor name received via #SENSOR_NAME event from nRF5340. */
 	UART_SENSOR_ESL_NAME_RESPONSE = 0xB,
 
+	/** Sensor whitelist management event from nRF5340 (#SENSOR_MGMT:*). */
+	UART_SENSOR_SENSOR_MGMT_EVENT = 0xC,
+
+	/** Sensor blocked by whitelist (#SENSOR_BLOCKED:*). */
+	UART_SENSOR_SENSOR_BLOCKED = 0xD,
+
 	/* Input message types */
 
 	/** Request to sample sensor data from all ESL tags. */
@@ -263,6 +269,74 @@ int uart_sensor_esl_get_nus_failures(void);
  * as {"type":"uart_debug","line":"..."}. Disabled by default (production-safe).
  */
 int uart_sensor_set_debug_echo(bool enable);
+
+/* ---- Sensor whitelist management (forwarded to nRF5340 gateway) ---- */
+
+/** @brief Send a sensor_mgmt command to the nRF5340 gateway.
+ *  The cmd string is sent as-is (e.g. "sensor_mgmt add AA:BB:CC:DD:EE:FF").
+ */
+int uart_sensor_mgmt_command(const char *cmd);
+
+/** @brief Query gateway sensor whitelist status. */
+int uart_sensor_mgmt_status(void);
+
+/** @brief Set whitelist mode ("whitelist" or "open"). */
+int uart_sensor_mgmt_set_mode(const char *mode);
+
+/** @brief Add a sensor BLE address to the whitelist. */
+int uart_sensor_mgmt_add(const char *ble_addr);
+
+/** @brief Remove a sensor BLE address from the whitelist. */
+int uart_sensor_mgmt_remove(const char *ble_addr);
+
+/** @brief List all sensors in the whitelist. */
+int uart_sensor_mgmt_list(void);
+
+/** @brief Clear all sensors from the whitelist. */
+int uart_sensor_mgmt_clear(void);
+
+/** @brief Mark provisioning complete on the gateway. */
+int uart_sensor_mgmt_provision_done(void);
+
+/** @brief Import a BLE bond key for a sensor. */
+int uart_sensor_mgmt_set_key(const char *ble_addr, const char *hex_key);
+
+/** @brief Export a BLE bond key for a sensor. */
+int uart_sensor_mgmt_get_key(const char *ble_addr);
+
+/* ---- Low-level SPI bus access (for SPI DFU transport) ---- */
+
+/**
+ * @brief Lock the SPI bus mutex.
+ *
+ * The caller must call uart_sensor_spi_unlock() when done.  While locked,
+ * the DRDY work handler and all other SPI users will block.
+ *
+ * @param timeout  How long to wait for the mutex.
+ * @return 0 on success, negative errno on timeout.
+ */
+int uart_sensor_spi_lock(k_timeout_t timeout);
+
+/** @brief Unlock the SPI bus mutex. */
+void uart_sensor_spi_unlock(void);
+
+/**
+ * @brief Perform a raw 520-byte full-duplex SPI transaction.
+ *
+ * The caller MUST hold the SPI bus lock (via uart_sensor_spi_lock()).
+ * The function asserts CS, transceives, and deasserts CS.
+ *
+ * @param tx  Pointer to 520-byte TX frame (pre-built by caller).
+ * @param rx  Pointer to 520-byte RX buffer.
+ * @return 0 on success, negative errno on SPI error.
+ */
+int uart_sensor_spi_xfer_locked(const uint8_t *tx, uint8_t *rx);
+
+/**
+ * @brief Check if DATA_READY GPIO from nRF5340 is currently asserted.
+ * @return true if DATA_READY is HIGH, false otherwise.
+ */
+bool uart_sensor_spi_drdy_active(void);
 
 #ifdef __cplusplus
 }

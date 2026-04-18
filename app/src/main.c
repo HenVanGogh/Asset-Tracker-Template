@@ -67,6 +67,7 @@ ZBUS_CHAN_DEFINE(TIMER_CHAN,
 	X(NETWORK_CHAN,		struct network_msg)		\
 	LOCATION_CHANNELS(X)				\
 	UART_SENSOR_CHANNELS(X)			\
+	FOTA_CHANNELS(X)				\
 	X(TIMER_CHAN,		int)
 
 /* Define cloud channels based on configuration */
@@ -90,6 +91,13 @@ ZBUS_CHAN_DEFINE(TIMER_CHAN,
 #define UART_SENSOR_CHANNELS(X) X(UART_SENSOR_CHAN, struct uart_sensor_msg)
 #else
 #define UART_SENSOR_CHANNELS(X)
+#endif
+
+/* Define FOTA channels based on configuration */
+#if defined(CONFIG_APP_FOTA)
+#define FOTA_CHANNELS(X) X(FOTA_CHAN, enum fota_msg_type)
+#else
+#define FOTA_CHANNELS(X)
 #endif
 
 /* Calculate the maximum message size from the list of channels */

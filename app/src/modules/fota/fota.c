@@ -237,6 +237,11 @@ static void state_idle_run(void *obj)
 	enum fota_msg_type msg = MSG_TO_FOTA_TYPE(s->msg_buf);
 
 	if (msg == FOTA_POLL_REQUEST) {
+		if (strlen(fota_pending_url) == 0) {
+			LOG_WRN("FOTA: ignoring FOTA_POLL_REQUEST with empty URL");
+			smf_set_handled(SMF_CTX(s));
+			return;
+		}
 		smf_set_state(SMF_CTX(s), &states[STATE_DOWNLOADING]);
 	} else if (msg == FOTA_DOWNLOAD_CANCEL) {
 		LOG_DBG("FOTA: no active download to cancel");
