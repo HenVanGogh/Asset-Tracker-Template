@@ -42,7 +42,7 @@ target_link_options(app PRIVATE --whole-archive)
 add_compile_options(-Wno-return-type)
 
 set_property(SOURCE ${ASSET_TRACKER_TEMPLATE_DIR}/app/src/main.c PROPERTY COMPILE_FLAGS
-	     "-include ${CMAKE_CURRENT_SOURCE_DIR}/src/redef.h")
+	     "-include ${CMAKE_CURRENT_SOURCE_DIR}/src/redef.h -Wno-unused-variable")
 
 # Options that cannot be passed through Kconfig fragments
 target_compile_definitions(app PRIVATE
@@ -72,6 +72,8 @@ target_compile_definitions(app PRIVATE
 	-DCONFIG_LOCATION_METHOD_WIFI=1
 	-DCONFIG_LOCATION_METHODS_LIST_SIZE=3
 	-DCONFIG_NRF_CLOUD_AGNSS=y
+	-DCONFIG_APP_CLOUD=1
+	-DCONFIG_APP_FOTA=1
 )
 
 # CONSIDER: REUSING THE CODEC GENERATION LOGIC FROM THE MAIN APP

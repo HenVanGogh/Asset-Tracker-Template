@@ -201,53 +201,107 @@ static void lte_lc_evt_handler(const struct lte_lc_evt *const evt)
 {
 	switch (evt->type) {
 	case LTE_LC_EVT_NW_REG_STATUS:
-		if (evt->nw_reg_status == LTE_LC_NW_REG_UICC_FAIL) {
-			LOG_ERR("No SIM card detected!");
-			network_status_notify(NETWORK_UICC_FAILURE);
-		} else if (evt->nw_reg_status == LTE_LC_NW_REG_NOT_REGISTERED) {
-			LOG_WRN("Not registered, check rejection cause");
+		/* Log every registration status change for field diagnostics */
+		switch (evt->nw_reg_status) {
+		case LTE_LC_NW_REG_NOT_REGISTERED:
+			LOG_WRN("LTE: Not registered (not searching)");
 			network_status_notify(NETWORK_ATTACH_REJECTED);
+			break;
+		case LTE_LC_NW_REG_REGISTERED_HOME:
+			LOG_INF("LTE: Registered — home network");
+			break;
+		case LTE_LC_NW_REG_SEARCHING:
+			LOG_INF("LTE: Searching for operator...");
+			break;
+		case LTE_LC_NW_REG_REGISTRATION_DENIED:
+			LOG_ERR("LTE: Registration DENIED — SIM may not be allowed on this network");
+			network_status_notify(NETWORK_ATTACH_REJECTED);
+			break;
+		case LTE_LC_NW_REG_UNKNOWN:
+			LOG_WRN("LTE: Registration status unknown (out of coverage?)");
+			break;
+		case LTE_LC_NW_REG_REGISTERED_ROAMING:
+			LOG_INF("LTE: Registered — roaming");
+			break;
+		case LTE_LC_NW_REG_UICC_FAIL:
+			LOG_ERR("LTE: UICC (SIM) failure — no SIM card detected");
+			network_status_notify(NETWORK_UICC_FAILURE);
+			break;
+		default:
+			LOG_WRN("LTE: Unknown registration status: %d", evt->nw_reg_status);
+			break;
 		}
 		break;
+
+	case LTE_LC_EVT_CELL_UPDATE:
+		/* Log cell changes — useful for detecting steering-of-roaming events */
+		LOG_INF("LTE: Cell update — MCC=%d MNC=%d TAC=0x%04X CID=0x%08X RSRP=%d dBm",
+			evt->cell.mcc, evt->cell.mnc,
+			evt->cell.tac, evt->cell.id,
+			(evt->cell.rsrp != 255) ? (int)(evt->cell.rsrp - 140) : -999);
+		break;
+
+	case LTE_LC_EVT_LTE_MODE_UPDATE:
+		switch (evt->lte_mode) {
+		case LTE_LC_LTE_MODE_LTEM:
+			LOG_INF("LTE: Mode changed to LTE-M");
+			break;
+		case LTE_LC_LTE_MODE_NBIOT:
+			LOG_INF("LTE: Mode changed to NB-IoT");
+			break;
+		case LTE_LC_LTE_MODE_NONE:
+			LOG_WRN("LTE: Mode changed to NONE (no active LTE connection)");
+			break;
+		default:
+			LOG_WRN("LTE: Mode changed to unknown (%d)", evt->lte_mode);
+			break;
+		}
+		break;
+
 	case LTE_LC_EVT_MODEM_EVENT:
 		/* If a reset loop happens in the field, it should not be necessary
 		 * to perform any action. The modem will try to re-attach to the LTE network after
 		 * the 30-minute block.
 		 */
 		if (evt->modem_evt == LTE_LC_MODEM_EVT_RESET_LOOP) {
-			LOG_WRN("The modem has detected a reset loop!");
+			LOG_WRN("LTE: Modem reset loop detected!");
 			network_status_notify(NETWORK_MODEM_RESET_LOOP);
 		} else if (evt->modem_evt == LTE_LC_MODEM_EVT_LIGHT_SEARCH_DONE) {
-			LOG_DBG("LTE_LC_MODEM_EVT_LIGHT_SEARCH_DONE");
+			LOG_DBG("LTE: Light network search done");
 			network_status_notify(NETWORK_LIGHT_SEARCH_DONE);
 		}
 		break;
+
 	case LTE_LC_EVT_PSM_UPDATE: {
 		struct network_msg msg = {
 			.type = NETWORK_PSM_PARAMS,
 			.psm_cfg = evt->psm_cfg,
 		};
 
-		LOG_DBG("PSM parameters received, TAU: %d, Active time: %d",
-			msg.psm_cfg.tau, msg.psm_cfg.active_time);
+		if (msg.psm_cfg.tau > 0) {
+			LOG_INF("LTE: PSM granted — TAU: %d s, Active time: %d s",
+				msg.psm_cfg.tau, msg.psm_cfg.active_time);
+		} else {
+			LOG_WRN("LTE: PSM not granted by network (TAU=%d)", msg.psm_cfg.tau);
+		}
 
 		network_msg_send(&msg);
-
 		break;
 	}
+
 	case LTE_LC_EVT_EDRX_UPDATE: {
 		struct network_msg msg = {
 			.type = NETWORK_EDRX_PARAMS,
 			.edrx_cfg = evt->edrx_cfg,
 		};
 
-		LOG_DBG("eDRX parameters received, mode: %d, eDRX: %0.2f s, PTW: %.02f s",
+		LOG_DBG("LTE: eDRX update — mode: %d, eDRX: %.2f s, PTW: %.2f s",
 			msg.edrx_cfg.mode, (double)msg.edrx_cfg.edrx, (double)msg.edrx_cfg.ptw);
 
 		network_msg_send(&msg);
-
 		break;
 	}
+
 	default:
 		break;
 	}

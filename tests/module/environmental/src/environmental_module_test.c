@@ -193,6 +193,37 @@ void test_sensor_sample(void)
 	}
 }
 
+/* Multiple back-to-back sample requests should each produce a request and
+ * a response message — i.e. the module's queue does not drop events.
+ *
+ * With native_sim fast clocking both publishes hit the channel before the
+ * module wakes, so the subscriber FIFO accumulates [REQ, REQ, RESP, RESP].
+ */
+void test_back_to_back_requests(void)
+{
+	send_environmental_sample_request();
+	send_environmental_sample_request();
+
+	/* Both REQUESTs arrive first (synchronously placed in the FIFO),
+	 * then both RESPONSEs once the module processes them. */
+	check_environmental_event(ENVIRONMENTAL_SENSOR_SAMPLE_REQUEST);
+	check_environmental_event(ENVIRONMENTAL_SENSOR_SAMPLE_REQUEST);
+	check_environmental_event(ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE);
+	check_environmental_event(ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE);
+}
+
+/* The watchdog must be fed at least once during normal idle waiting so the
+ * module is not killed by the task watchdog.
+ */
+void test_watchdog_is_fed_while_idle(void)
+{
+	RESET_FAKE(task_wdt_feed);
+
+	k_sleep(K_SECONDS(CONFIG_APP_ENVIRONMENTAL_MSG_PROCESSING_TIMEOUT_SECONDS + 1));
+
+	TEST_ASSERT_GREATER_OR_EQUAL(1, task_wdt_feed_fake.call_count);
+}
+
 /* This is required to be added to each test. That is because unity's
  * main may return nonzero, while zephyr's main currently must
  * return 0 in all cases (other values are reserved).

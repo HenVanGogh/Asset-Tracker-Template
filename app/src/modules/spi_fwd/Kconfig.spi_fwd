@@ -1,0 +1,41 @@
+#
+# Copyright (c) 2025 Nordic Semiconductor ASA
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+menuconfig APP_SPI_FWD
+	bool "SPI SMP Forward — serve nRF9151 DFU via nRF5340 USB bridge"
+	default n
+	depends on APP_UART_SENSOR
+	depends on FLASH
+	depends on FLASH_MAP
+	depends on MCUMGR
+	depends on MCUMGR_GRP_IMG
+	depends on MCUMGR_GRP_OS
+	help
+	  Enable FRAME_SMP_FWD (0x07) handling on the nRF9151.
+
+	  When a PC connects to the nRF5340 via USB and runs mcumgr or
+	  nrfutil to update the nRF9151 firmware, the nRF5340 relays raw
+	  SMP packets to the nRF9151 as FRAME_SMP_FWD (0x07) frames.
+
+	  This module registers an MCUmgr SMP server transport that:
+	    - Receives the SMP payload from uart_sensor.c
+	    - Feeds it to MCUmgr (image upload, os_reset, etc.)
+	    - Returns the MCUmgr response to the nRF5340 as a FRAME_SMP_FWD
+	    - nRF5340 relays the response to the PC via USB CDC-ACM
+
+if APP_SPI_FWD
+
+config MCUMGR_TRANSPORT_NETBUF_SIZE
+	default 512
+
+config MCUMGR_TRANSPORT_WORKQUEUE_STACK_SIZE
+	default 4096
+
+module = APP_SPI_FWD
+module-str = SPI_FWD
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # APP_SPI_FWD

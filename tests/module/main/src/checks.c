@@ -23,6 +23,18 @@ ZBUS_CHAN_ADD_OBS(LOCATION_CHAN, location_subscriber, 0);
 ZBUS_CHAN_ADD_OBS(NETWORK_CHAN, network_subscriber, 0);
 ZBUS_CHAN_ADD_OBS(POWER_CHAN, power_subscriber, 0);
 
+/* Stub for power_sample_request — main.c calls this but the power module
+ * is not compiled into this test. Publish a POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST
+ * to POWER_CHAN so tests can observe the request via power_subscriber. */
+int power_sample_request(void)
+{
+	struct power_msg msg = {
+		.type = POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST,
+	};
+	(void)zbus_chan_pub(&POWER_CHAN, &msg, K_MSEC(500));
+	return 0;
+}
+
 LOG_MODULE_REGISTER(main_module_checks, 4);
 
 void expect_location_event(enum location_msg_type expected_location_type)
@@ -351,5 +363,37 @@ int wait_for_location_event(enum location_msg_type expected_type, uint32_t timeo
 
 	LOG_DBG("Received expected location event: %d, wait: %d", location_msg_type, elapsed_time);
 
+	return elapsed_time;
+}
+
+int wait_for_network_event(enum network_msg_type expected_type, uint32_t timeout_sec)
+{
+	int err;
+	const struct zbus_channel *chan;
+	struct network_msg network_msg;
+	uint32_t start_time = k_uptime_seconds();
+	uint32_t elapsed_time;
+
+	err = zbus_sub_wait_msg(&network_subscriber, &chan, &network_msg,
+				K_SECONDS(timeout_sec));
+	if (err == -ENOMSG) {
+		return -ENOMSG;
+	} else if (err) {
+		LOG_ERR("zbus_sub_wait, error: %d", err);
+		return err;
+	}
+
+	if (chan != &NETWORK_CHAN) {
+		LOG_ERR("Received message from wrong channel");
+		return -EINVAL;
+	}
+
+	if (network_msg.type != expected_type) {
+		LOG_ERR("Received unexpected network event: %d (expected %d)",
+			network_msg.type, expected_type);
+		return -EINVAL;
+	}
+
+	elapsed_time = k_uptime_seconds() - start_time;
 	return elapsed_time;
 }

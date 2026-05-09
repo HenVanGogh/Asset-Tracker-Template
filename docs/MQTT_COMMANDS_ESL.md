@@ -349,16 +349,19 @@ asynchronously as a `sensor_name` MQTT publication (not included in this command
 These commands communicate with individual tags via the BLE NUS (Nordic UART Service) channel.
 The target tag is identified by its ESL address (decimal integer).
 
+Use `esl_id` for new integrations. The older `id` field is still accepted as a compatibility alias.
+
 ### `esl_nus_status`
 
 Request NUS status from a specific ESL tag.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `id` | integer | Yes | ESL address (decimal) |
+| `esl_id` | integer | Yes | ESL address (decimal) |
+| `id` | integer | No | Legacy alias for `esl_id` |
 
 ```json
-{"command": "esl_nus_status", "id": 1}
+{"command": "esl_nus_status", "esl_id": 1}
 ```
 
 **Response:**
@@ -378,10 +381,11 @@ Request current sensor data from a specific ESL tag via NUS.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `id` | integer | Yes | ESL address (decimal) |
+| `esl_id` | integer | Yes | ESL address (decimal) |
+| `id` | integer | No | Legacy alias for `esl_id` |
 
 ```json
-{"command": "esl_nus_sensors", "id": 1}
+{"command": "esl_nus_sensors", "esl_id": 1}
 ```
 
 **Response:**
@@ -401,10 +405,11 @@ Reset the NUS BLE connection to a specific tag. Useful to recover from a stuck c
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `id` | integer | Yes | ESL address (decimal) |
+| `esl_id` | integer | Yes | ESL address (decimal) |
+| `id` | integer | No | Legacy alias for `esl_id` |
 
 ```json
-{"command": "esl_nus_reset", "id": 2}
+{"command": "esl_nus_reset", "esl_id": 2}
 ```
 
 **Response:**
@@ -424,10 +429,11 @@ Toggle the LED on a specific tag via NUS.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `id` | integer | Yes | ESL address (decimal) |
+| `esl_id` | integer | Yes | ESL address (decimal) |
+| `id` | integer | No | Legacy alias for `esl_id` |
 
 ```json
-{"command": "esl_nus_led", "id": 1}
+{"command": "esl_nus_led", "esl_id": 1}
 ```
 
 **Response:**

@@ -1151,11 +1151,14 @@ static void dfu_thread_fn(void *p1, void *p2, void *p3)
 
 int spi_dfu_start_nrf5340(void)
 {
+	LOG_INF("SPI DFU: start_nrf5340 requested");
+
 	k_mutex_lock(&dfu_ctx.lock, K_FOREVER);
 
 	if (dfu_ctx.state == SPI_DFU_STATE_UPLOADING ||
 	    dfu_ctx.state == SPI_DFU_STATE_TESTING ||
 	    dfu_ctx.state == SPI_DFU_STATE_RESETTING) {
+		LOG_WRN("SPI DFU: already in progress (state=%d)", dfu_ctx.state);
 		k_mutex_unlock(&dfu_ctx.lock);
 		return -EBUSY;
 	}
@@ -1165,9 +1168,15 @@ int spi_dfu_start_nrf5340(void)
 	int rc = ext_dfu_get_status(EXT_DFU_TARGET_NRF5340, &st);
 
 	if (rc || st.state != EXT_DFU_STATE_DONE || st.bytes_written == 0) {
+		LOG_ERR("SPI DFU: no firmware available — download first "
+			"(ext_dfu state=%d bytes=%u rc=%d)",
+			st.state, (unsigned int)st.bytes_written, rc);
 		k_mutex_unlock(&dfu_ctx.lock);
 		return -ENOENT;
 	}
+
+	LOG_INF("SPI DFU: firmware ready (%u bytes) — starting upload to nRF5340",
+		(unsigned int)st.bytes_written);
 
 	dfu_ctx.state = SPI_DFU_STATE_UPLOADING;
 	k_mutex_unlock(&dfu_ctx.lock);

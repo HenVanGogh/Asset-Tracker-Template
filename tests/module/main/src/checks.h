@@ -33,3 +33,10 @@ void purge_all_events(void);
  * Otherwise, it returns a negative value.
  */
 int wait_for_location_event(enum location_msg_type expected_type, uint32_t timeout_sec);
+
+/* Wait for a network event of the expected type.
+ *
+ * Returns the time in seconds it took to receive the event if it is received within the timeout.
+ * Otherwise, it returns a negative value.
+ */
+int wait_for_network_event(enum network_msg_type expected_type, uint32_t timeout_sec);

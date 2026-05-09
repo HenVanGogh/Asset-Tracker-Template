@@ -44,6 +44,9 @@
 
 #include "uart_sensor.h"
 #include "custom_mqtt.h"
+#if defined(CONFIG_APP_SPI_FWD)
+#include "spi_fwd.h"
+#endif
 #include <date_time.h>
 #include <zephyr/settings/settings.h>
 
@@ -66,6 +69,8 @@ LOG_MODULE_REGISTER(uart_sensor, CONFIG_APP_UART_SENSOR_LOG_LEVEL);
 #define SPI_TYPE_NOTIFY     0x03   /* nRF53 → nRF91: URC notification */
 #define SPI_TYPE_READ_REQ   0x04   /* nRF91 → nRF53: poll for pending data */
 #define SPI_TYPE_NOOP       0x05   /* either: keepalive / empty */
+#define SPI_TYPE_SMP        0x06   /* nRF91 → nRF53: MCUmgr SMP client (spi_dfu) */
+#define SPI_TYPE_SMP_FWD    0x07   /* bidirectional: MCUmgr SMP forward via USB bridge */
 #define SPI_TYPE_INVALID    0xFF   /* framing error */
 
 /* ---- Hardware ---- */
@@ -113,6 +118,14 @@ static int tag_count;
  * messages with the correct tag (nRF5340 does not include the address in those
  * URCs). Starts at 0x0000 (unknown) and is updated upon every tag event. */
 static uint16_t last_polled_esl_addr;
+
+/* Address of the most recent unicast `nus get_name 0x<addr>` we issued.
+ * The gateway sometimes emits #SENSOR_NAME:0x0000,<name> when the response
+ * arrives via the broadcast subevent slot (resp_addr is reconstructed from
+ * group_id + last_nus_target_low[group_id] and resolves to 0 for group 0
+ * before the per-group target table has been written by the gateway).
+ * In that case we attribute the reply to the pending request. */
+static uint16_t pending_get_name_addr;
 
 /* ---- Dedicated work queue for SPI transactions (sysworkq stack is too small) ---- */
 #define SPI_WQ_STACK_SIZE 4096
@@ -248,6 +261,19 @@ static struct k_work_delayable esl_startup_work;
 static int esl_startup_step;
 static bool esl_ap_ready;  /* true once we see the shell prompt */
 
+/* Gateway provisioning state, learned from "#SENSOR_MGMT:STATUS,...,PROVISIONED=<0|1>".
+ * When true, the whitelist is sealed and the gateway already knows the fleet:
+ * we MUST NOT scan/onboard on boot \u2014 doing so steals PA-train air-time and
+ * can cause #PAWR_GAP events (see NRF91_USAGE_GUIDE.md \u00a72/\u00a77).
+ * Tri-state: -1 = unknown, 0 = not provisioned, 1 = provisioned.
+ */
+static int gateway_provisioned = -1;
+
+/* Monotonic uptime of the last on-demand scan request \u2014 used to enforce the
+ * \u22655 min back-off recommended by NRF91_USAGE_GUIDE.md \u00a78. */
+static int64_t last_scan_request_ms;
+#define ESL_SCAN_MIN_INTERVAL_MS  (5 * 60 * 1000)
+
 /* ---- Time sync helpers ---- */
 
 /**
@@ -353,6 +379,8 @@ static void update_statistics(bool parse_success, bool validation_success, bool 
 static void esl_poll_work_fn(struct k_work *work);
 static void esl_startup_work_fn(struct k_work *work);
 static int esl_tag_db_find_or_add(uint16_t esl_addr);
+static float esl_battery_pct_from_mv(uint32_t batt_mv);
+static void esl_store_sensor_snapshot(uint16_t esl_addr, int tag_index, bool publish);
 static int esl_count_connected(void);
 static void esl_discovery_check(void);
 static void scan_retry_work_fn(struct k_work *work);
@@ -464,6 +492,18 @@ static void process_rx_frame(const uint8_t *buf)
 		if (enqueued_any) {
 			k_sem_give(&uart_wake_sem);
 		}
+#if defined(CONFIG_APP_SPI_FWD)
+	} else if (type == SPI_TYPE_SMP_FWD) {
+		/* MCUmgr SMP request forwarded by nRF5340 from a PC via USB.
+		 * Feed the raw SMP payload to the spi_fwd module which runs
+		 * the nRF9151's MCUmgr server and sends the response back. */
+		if (len > 0 && len <= SPI_PAYLOAD_MAX) {
+			LOG_INF("SPI RX: FRAME_SMP_FWD len=%u → MCUmgr", len);
+			spi_fwd_rx(&buf[SPI_OFF_PAYLOAD], len);
+		} else {
+			LOG_WRN("SPI RX: FRAME_SMP_FWD bad len=%u, dropped", len);
+		}
+#endif /* CONFIG_APP_SPI_FWD */
 	} else if (type != SPI_TYPE_NOOP) {
 		LOG_DBG("SPI RX: type=0x%02X len=%u (no text)", type, len);
 	}
@@ -621,6 +661,51 @@ bool uart_sensor_spi_drdy_active(void)
 	return gpio_pin_get_dt(&esl_drdy_gpio) > 0;
 }
 
+int uart_sensor_spi_send_smp_fwd(const uint8_t *payload, uint16_t len)
+{
+	if (!payload || len == 0 || len > SPI_PAYLOAD_MAX) {
+		return -EINVAL;
+	}
+
+	LOG_INF(">>> SPI TX (SMP_FWD): %u bytes", len);
+
+	k_mutex_lock(&spi_bus_mutex, K_FOREVER);
+
+	build_frame(spi_tx_frame, SPI_TYPE_SMP_FWD, (const char *)payload, len);
+
+	const struct spi_buf     tx_buf = { .buf = spi_tx_frame,
+					    .len = SPI_FRAME_SIZE };
+	const struct spi_buf     rx_buf = { .buf = spi_rx_frame,
+					    .len = SPI_FRAME_SIZE };
+	const struct spi_buf_set tx_set = { .buffers = &tx_buf, .count = 1 };
+	const struct spi_buf_set rx_set = { .buffers = &rx_buf, .count = 1 };
+
+	gpio_pin_set_dt(&esl_cs_gpio, 1);
+	int ret = spi_transceive(spi_dev, &spi_cfg, &tx_set, &rx_set);
+	gpio_pin_set_dt(&esl_cs_gpio, 0);
+
+	k_mutex_unlock(&spi_bus_mutex);
+
+	if (ret != 0) {
+		LOG_ERR("SPI SMP_FWD transceive error: %d", ret);
+		return ret;
+	}
+
+	/* Full-duplex: simultaneous RX may carry a NOTIFY or NOOP */
+	process_rx_frame(spi_rx_frame);
+
+	if (gpio_pin_get_dt(&esl_drdy_gpio) > 0) {
+		k_work_submit_to_queue(&spi_work_q, &spi_rx_work);
+	}
+
+	return 0;
+}
+
+void uart_sensor_spi_submit_work(struct k_work *work)
+{
+	k_work_submit_to_queue(&spi_work_q, work);
+}
+
 /* Convenience: send "esl_c <subcmd>" */
 int uart_sensor_esl_command(const char *esl_cmd)
 {
@@ -650,6 +735,7 @@ int uart_sensor_esl_command(const char *esl_cmd)
 int uart_sensor_esl_scan_start(void)
 {
 	LOG_INF("ESL: starting scan (oneshot)");
+	last_scan_request_ms = k_uptime_get();
 	return uart_sensor_esl_command("acl scan 1 1");
 }
 
@@ -663,8 +749,10 @@ int uart_sensor_esl_nus_status(uint16_t esl_id)
 {
 	char cmd[48];
 
-	snprintf(cmd, sizeof(cmd), "nus status %u", esl_id);
-	LOG_INF("ESL: requesting NUS status for tag %u", esl_id);
+	/* Gateway requires unicast hex address (0x<addr>); decimal silently
+	 * resolves to broadcast (0x0000) and the sensor will not reply. */
+	snprintf(cmd, sizeof(cmd), "nus status 0x%04x", esl_id);
+	LOG_INF("ESL: requesting NUS status for tag 0x%04X", esl_id);
 	return uart_sensor_esl_command(cmd);
 }
 
@@ -672,17 +760,87 @@ int uart_sensor_esl_nus_sensors(uint16_t esl_id)
 {
 	char cmd[48];
 
-	snprintf(cmd, sizeof(cmd), "nus sensors %u", esl_id);
-	LOG_INF("ESL: requesting NUS sensors for tag %u", esl_id);
+	snprintf(cmd, sizeof(cmd), "nus sensors 0x%04x", esl_id);
+	LOG_INF("ESL: requesting NUS sensors for tag 0x%04X", esl_id);
 	return uart_sensor_esl_command(cmd);
 }
 
 int uart_sensor_esl_get_name(uint16_t esl_id)
 {
-	ARG_UNUSED(esl_id);
-	/* AP shell cmd: "esl_c nus get_name" — no address argument */
-	LOG_INF("ESL: requesting sensor name (nus get_name)");
-	return uart_sensor_esl_command("nus get_name");
+	char cmd[48];
+	/* Per-tag dedup state: skip duplicate requests within the cooldown
+	 * window. Triggered from many sites (parse_configured, SENSOR_SYNCED,
+	 * startup fan-out, MQTT command) which previously caused the same
+	 * `nus get_name` to be issued 2-3 times back-to-back. */
+	static int64_t last_get_name_ms[ESL_MAX_TAGS];
+	static uint16_t last_get_name_addr[ESL_MAX_TAGS];
+	const int64_t COOLDOWN_MS = 30 * 1000;
+	const int64_t now = k_uptime_get();
+
+	/* esl_id == 0xFFFF means "all known tags" — fan out one unicast
+	 * request per tag (the gateway has no broadcast variant for this). */
+	if (esl_id == 0xFFFF) {
+		int sent = 0;
+
+		for (int i = 0; i < tag_count; i++) {
+			if (!tag_db[i].valid || tag_db[i].esl_addr == 0xFFFF) {
+				continue;
+			}
+			/* Skip if we already learned the name. */
+			if (tag_db[i].name[0] != '\0') {
+				continue;
+			}
+			/* Skip if a request for this addr is still in cooldown. */
+			if (i < ESL_MAX_TAGS &&
+			    last_get_name_addr[i] == tag_db[i].esl_addr &&
+			    (now - last_get_name_ms[i]) < COOLDOWN_MS) {
+				continue;
+			}
+			pending_get_name_addr = tag_db[i].esl_addr;
+			snprintf(cmd, sizeof(cmd), "nus get_name 0x%04x",
+				 tag_db[i].esl_addr);
+			(void)uart_sensor_esl_command(cmd);
+			if (i < ESL_MAX_TAGS) {
+				last_get_name_addr[i] = tag_db[i].esl_addr;
+				last_get_name_ms[i] = now;
+			}
+			sent++;
+			/* Pace per gateway requirement: ≥2 s between NUS cmds */
+			k_sleep(K_SECONDS(2));
+		}
+		LOG_INF("ESL: requested sensor name for %d tag(s)", sent);
+		return 0;
+	}
+
+	/* Single-target request — apply the same dedup. */
+	int idx = -1;
+
+	for (int i = 0; i < tag_count && i < ESL_MAX_TAGS; i++) {
+		if (tag_db[i].esl_addr == esl_id) {
+			idx = i;
+			break;
+		}
+	}
+	if (idx >= 0) {
+		if (tag_db[idx].name[0] != '\0') {
+			LOG_DBG("ESL get_name 0x%04X: name already known ('%s'), skipping",
+				esl_id, tag_db[idx].name);
+			return 0;
+		}
+		if (last_get_name_addr[idx] == esl_id &&
+		    (now - last_get_name_ms[idx]) < COOLDOWN_MS) {
+			LOG_DBG("ESL get_name 0x%04X: in cooldown (%lld ms ago), skipping",
+				esl_id, (long long)(now - last_get_name_ms[idx]));
+			return 0;
+		}
+		last_get_name_addr[idx] = esl_id;
+		last_get_name_ms[idx] = now;
+	}
+
+	pending_get_name_addr = esl_id;
+	snprintf(cmd, sizeof(cmd), "nus get_name 0x%04x", esl_id);
+	LOG_INF("ESL: requesting sensor name for tag 0x%04X", esl_id);
+	return uart_sensor_esl_command(cmd);
 }
 
 int uart_sensor_esl_set_ap_time(void)
@@ -717,6 +875,58 @@ static int esl_tag_db_find_or_add(uint16_t esl_addr)
 	return idx;
 }
 
+static float esl_battery_pct_from_mv(uint32_t batt_mv)
+{
+	if (batt_mv == 0) {
+		return 0.0f;
+	}
+
+	float range_mv = (float)(UART_BATTERY_MAX_MV - UART_BATTERY_MIN_MV);
+
+	if (range_mv <= 0.0f) {
+		return 0.0f;
+	}
+
+	float batt_pct = ((float)batt_mv - (float)UART_BATTERY_MIN_MV) * 100.0f / range_mv;
+
+	if (batt_pct > 100.0f) {
+		batt_pct = 100.0f;
+	}
+	if (batt_pct < 0.0f) {
+		batt_pct = 0.0f;
+	}
+
+	return batt_pct;
+}
+
+static void esl_store_sensor_snapshot(uint16_t esl_addr, int tag_index, bool publish)
+{
+	if (tag_index < 0) {
+		return;
+	}
+
+	struct uart_sensor_msg snapshot = { 0 };
+
+	snapshot.type = UART_SENSOR_ESL_NUS_RESPONSE;
+	snapshot.timestamp = k_uptime_get();
+	snprintf(snapshot.probe_id, sizeof(snapshot.probe_id),
+		 "ESL_0x%04X", esl_addr);
+	snapshot.tag_info = tag_db[tag_index];
+	snapshot.temperature = tag_db[tag_index].temperature;
+	snapshot.probe_battery = esl_battery_pct_from_mv(tag_db[tag_index].battery_mv);
+	snapshot.data_quality.probe_id_valid = true;
+	snapshot.data_quality.temperature_valid = (tag_db[tag_index].temperature != 0.0f);
+	snapshot.data_quality.battery_valid = (tag_db[tag_index].battery_mv > 0);
+
+	k_mutex_lock(&uart_data_mutex, K_FOREVER);
+	current_sensor_data = snapshot;
+	k_mutex_unlock(&uart_data_mutex);
+
+	if (publish && uart_module_state.auto_publish_enabled) {
+		zbus_chan_pub(&UART_SENSOR_CHAN, &snapshot, K_MSEC(UART_ZBUS_TIMEOUT_MS));
+	}
+}
+
 int uart_sensor_esl_get_tag_count(void)
 {
 	return tag_count;
@@ -739,6 +949,15 @@ int uart_sensor_esl_get_tag_info(uint16_t esl_addr, struct esl_tag_info *info)
 		}
 	}
 	return -ENOENT;
+}
+
+int uart_sensor_esl_get_tag_info_at(int index, struct esl_tag_info *info)
+{
+	if (!info || index < 0 || index >= tag_count) {
+		return -EINVAL;
+	}
+	memcpy(info, &tag_db[index], sizeof(*info));
+	return 0;
 }
 
 /* ===========================================================================
@@ -775,6 +994,17 @@ static int parse_nus_status(const char *line)
 	uint16_t batt = 0;
 	uint8_t flags = 0;
 	const char *p;
+	uint16_t esl_addr = last_polled_esl_addr;
+
+	p = strstr(line, "ADDR=");
+	if (p) {
+		unsigned int parsed_addr = 0;
+
+		if (sscanf(p, "ADDR=0x%x", &parsed_addr) == 1 ||
+		    sscanf(p, "ADDR=%u", &parsed_addr) == 1) {
+			esl_addr = (uint16_t)parsed_addr;
+		}
+	}
 
 	/* Try #NUS_STATUS: format first */
 	p = strstr(line, "UP=");
@@ -794,6 +1024,11 @@ static int parse_nus_status(const char *line)
 		return -EINVAL; /* Didn't parse anything useful */
 	}
 
+	if (esl_addr == 0x0000 || esl_addr == 0xFFFF) {
+		LOG_WRN("Ignoring NUS status with unknown ESL address: %s", line);
+		return -EINVAL;
+	}
+
 	/* Optional temperature field: TEMP=22.50 (in °C) */
 	float temperature = 0.0f;
 	bool has_temp = false;
@@ -803,9 +1038,9 @@ static int parse_nus_status(const char *line)
 		has_temp = true;
 	}
 
-	/* Associate with the last seen ESL address from #CONFIGURED:/#TAG: events.
-	 * The nRF5340 does not include the address in #NUS_STATUS URCs. */
-	int idx = esl_tag_db_find_or_add(last_polled_esl_addr);
+	/* Prefer the ADDR field emitted by current gateway firmware. Older firmware
+	 * did not include it, so fall back to last_polled_esl_addr for legacy logs. */
+	int idx = esl_tag_db_find_or_add(esl_addr);
 	if (idx >= 0) {
 		tag_db[idx].uptime_s = uptime;
 		tag_db[idx].battery_mv = batt;
@@ -831,7 +1066,7 @@ static int parse_nus_status(const char *line)
 	current_sensor_data.timestamp = k_uptime_get();
 	snprintf(current_sensor_data.probe_id,
 		 sizeof(current_sensor_data.probe_id),
-		 "ESL_0x%04X", last_polled_esl_addr);
+		 "ESL_0x%04X", esl_addr);
 	if (idx >= 0) {
 		current_sensor_data.tag_info = tag_db[idx];
 	}
@@ -918,20 +1153,42 @@ static int parse_tag_scanned(const char *line)
 }
 
 /**
- * Parse "#CONFIGURED: <n>,0x<esl_addr>,0x<group>"
+ * Parse "#CONFIGURED: <success>,0x<conn_idx>,0x<esl_addr>"
+ *
+ * Gateway source (esl_client.c):
+ *   printk("#CONFIGURED: 1,0x%04x,0x%04x\n", config_work->conn_idx,
+ *          config_work->param.esl_addr);
+ *   printk("#CONFIGURED: 0,0x%02x,0x%04x\n …",  // failure path
+ *
+ * So field 1 is success/fail (1 = configured OK), field 2 is the connection
+ * index (NOT the ESL address \u2014 our previous parser had this swapped, which
+ * caused a phantom 0x0000 tag to appear in the DB), field 3 is the real
+ * ESL address that was provisioned.
  */
 static int parse_configured(const char *line)
 {
 	const char *p = line + strlen("#CONFIGURED:");
 	while (*p == ' ') p++;
 
-	int idx;
-	unsigned int esl_addr, group;
-	if (sscanf(p, "%d,0x%x,0x%x", &idx, &esl_addr, &group) < 2) {
+	int success = 0;
+	unsigned int conn_idx = 0, esl_addr = 0;
+	if (sscanf(p, "%d,0x%x,0x%x", &success, &conn_idx, &esl_addr) < 3) {
+		LOG_WRN("Could not parse #CONFIGURED: %s", line);
 		return -EINVAL;
 	}
 
-	LOG_INF("Tag configured: idx=%d esl_addr=0x%04X group=0x%04X", idx, esl_addr, group);
+	if (success != 1) {
+		LOG_WRN("Tag configure FAILED: conn_idx=0x%02X esl_addr=0x%04X",
+			conn_idx, esl_addr);
+		return 0;
+	}
+
+	if (esl_addr == 0x0000 || esl_addr == 0xFFFF) {
+		LOG_WRN("Ignoring #CONFIGURED with invalid esl_addr=0x%04X", esl_addr);
+		return 0;
+	}
+
+	LOG_INF("Tag configured: conn_idx=0x%02X esl_addr=0x%04X", conn_idx, esl_addr);
 
 	/* Track which tag is now active so subsequent SENSOR_REPORT/NUS_STATUS can
 	 * be associated with the correct tag address. */
@@ -954,8 +1211,10 @@ static int parse_configured(const char *line)
 		zbus_chan_pub(&UART_SENSOR_CHAN, &current_sensor_data,
 			      K_MSEC(UART_ZBUS_TIMEOUT_MS));
 	}
-	/* Request human-readable name for this newly configured tag */
-	uart_sensor_esl_command("nus get_name");
+	/* Request human-readable name for this newly configured tag.
+	 * Use the unicast helper \u2014 bare "nus get_name" defaults to 0x0001
+	 * and is silently dropped for any other address. */
+	(void)uart_sensor_esl_get_name((uint16_t)esl_addr);
 	return 0;
 }
 
@@ -1069,72 +1328,56 @@ int uart_sensor_process_data_line(const char *data)
 		return 0;
 	}
 
-	/* #SENSOR_REPORT:TEMP,<val> — PaWR periodic temperature from ESL tag */
+	/* #SENSOR_REPORT:TEMP,0x<ADDR>,<val> — PaWR periodic temperature from ESL tag */
 	if (strncmp(data, "#SENSOR_REPORT:TEMP,", 20) == 0) {
-		float temp = strtof(data + 20, NULL);
-		int idx = esl_tag_db_find_or_add(last_polled_esl_addr);
+		unsigned int esl_addr_u = 0;
+		float temp = 0.0f;
+
+		if (sscanf(data + 20, "0x%x,%f", &esl_addr_u, &temp) != 2) {
+			LOG_WRN("Bad SENSOR_REPORT TEMP format: %s", data);
+			return 0;
+		}
+		uint16_t esl_addr = (uint16_t)esl_addr_u;
+		if (esl_addr == 0x0000 || esl_addr == 0xFFFF) {
+			LOG_WRN("Ignoring SENSOR_REPORT TEMP for invalid addr 0x%04X", esl_addr);
+			return 0;
+		}
+		int idx = esl_tag_db_find_or_add(esl_addr);
 
 		if (idx >= 0) {
 			tag_db[idx].temperature = temp;
 			tag_db[idx].last_seen = k_uptime_get();
 		}
-		k_mutex_lock(&uart_data_mutex, K_FOREVER);
-		current_sensor_data.type = UART_SENSOR_ESL_NUS_RESPONSE;
-		current_sensor_data.temperature = temp;
-		current_sensor_data.tag_info.temperature = temp;
-		current_sensor_data.timestamp = k_uptime_get();
-		snprintf(current_sensor_data.probe_id,
-			 sizeof(current_sensor_data.probe_id),
-			 "ESL_0x%04X", last_polled_esl_addr);
-		if (idx >= 0) {
-			current_sensor_data.tag_info = tag_db[idx];
-			current_sensor_data.tag_info.temperature = temp;
-		}
-		current_sensor_data.data_quality.temperature_valid = true;
-		current_sensor_data.data_quality.probe_id_valid = true;
-		k_mutex_unlock(&uart_data_mutex);
-		LOG_INF("PaWR TEMP: %.2f C", (double)temp);
-		if (uart_module_state.auto_publish_enabled) {
-			k_work_reschedule_for_queue(&spi_work_q, &nus_settle_work, K_MSEC(200));
-		}
+		esl_store_sensor_snapshot(esl_addr, idx, false);
+		LOG_INF("PaWR TEMP: ESL_0x%04X %.2f C", esl_addr, (double)temp);
 		return 0;
 	}
 
-	/* #SENSOR_REPORT:BATT,<mV> — PaWR periodic battery voltage from ESL tag */
+	/* #SENSOR_REPORT:BATT,0x<ADDR>,<mV> — PaWR periodic battery voltage from ESL tag */
 	if (strncmp(data, "#SENSOR_REPORT:BATT,", 20) == 0) {
-		uint32_t batt_mv = (uint32_t)strtoul(data + 20, NULL, 10);
-		int idx = esl_tag_db_find_or_add(last_polled_esl_addr);
+		unsigned int esl_addr_u = 0;
+		unsigned int batt_mv_u = 0;
+
+		if (sscanf(data + 20, "0x%x,%u", &esl_addr_u, &batt_mv_u) != 2) {
+			LOG_WRN("Bad SENSOR_REPORT BATT format: %s", data);
+			return 0;
+		}
+		uint16_t esl_addr = (uint16_t)esl_addr_u;
+		if (esl_addr == 0x0000 || esl_addr == 0xFFFF) {
+			LOG_WRN("Ignoring SENSOR_REPORT BATT for invalid addr 0x%04X", esl_addr);
+			return 0;
+		}
+		uint32_t batt_mv = (uint32_t)batt_mv_u;
+		int idx = esl_tag_db_find_or_add(esl_addr);
 
 		if (idx >= 0) {
 			tag_db[idx].battery_mv = (uint16_t)batt_mv;
 			tag_db[idx].last_seen = k_uptime_get();
 		}
-		float batt_pct = (float)((batt_mv - UART_BATTERY_MIN_MV) * 100) /
-				 (UART_BATTERY_MAX_MV - UART_BATTERY_MIN_MV);
+		float batt_pct = esl_battery_pct_from_mv(batt_mv);
 
-		if (batt_pct > 100.0f) {
-			batt_pct = 100.0f;
-		}
-		if (batt_pct < 0.0f) {
-			batt_pct = 0.0f;
-		}
-		k_mutex_lock(&uart_data_mutex, K_FOREVER);
-		current_sensor_data.type = UART_SENSOR_ESL_NUS_RESPONSE;
-		current_sensor_data.probe_battery = batt_pct;
-		current_sensor_data.timestamp = k_uptime_get();
-		snprintf(current_sensor_data.probe_id,
-			 sizeof(current_sensor_data.probe_id),
-			 "ESL_0x%04X", last_polled_esl_addr);
-		if (idx >= 0) {
-			current_sensor_data.tag_info = tag_db[idx];
-		}
-		current_sensor_data.data_quality.battery_valid = true;
-		current_sensor_data.data_quality.probe_id_valid = true;
-		k_mutex_unlock(&uart_data_mutex);
-		LOG_INF("PaWR BATT: %u mV (%.0f%%)", batt_mv, (double)batt_pct);
-		if (uart_module_state.auto_publish_enabled) {
-			k_work_reschedule_for_queue(&spi_work_q, &nus_settle_work, K_MSEC(200));
-		}
+		LOG_INF("PaWR BATT: ESL_0x%04X %u mV (%.0f%%)", esl_addr, batt_mv, (double)batt_pct);
+		esl_store_sensor_snapshot(esl_addr, idx, true);
 		return 0;
 	}
 
@@ -1162,6 +1405,51 @@ int uart_sensor_process_data_line(const char *data)
 	}
 
 	/* Connected/Disconnected — BLE connection events during provisioning */
+	if (strncmp(data, "#SENSOR_SYNCED:0x", 17) == 0) {
+		/* Tag has joined the PAwR train. Per the gateway protocol guide
+		 * (NRF91_USAGE_GUIDE.md §3) we should immediately request the
+		 * human-readable name once \u2014 BEFORE the next auto-poll round.
+		 */
+		unsigned int esl_addr_u = 0;
+
+		if (sscanf(data + 17, "%x", &esl_addr_u) == 1) {
+			uint16_t addr = (uint16_t)esl_addr_u;
+			int idx = esl_tag_db_find_or_add(addr);
+
+			if (idx >= 0) {
+				tag_db[idx].connected = true;
+				tag_db[idx].last_seen = k_uptime_get();
+			}
+			LOG_INF("ESL synced: 0x%04X \u2014 fetching name", addr);
+			(void)uart_sensor_esl_get_name(addr);
+			esl_discovery_check();
+		} else {
+			LOG_WRN("Bad SENSOR_SYNCED format: %s", data);
+		}
+		return 0;
+	}
+
+	if (strncmp(data, "#SENSOR_DESYNC:0x", 17) == 0) {
+		/* Tag dropped off PAwR. Do NOT auto-rescan \u2014 the gateway and the
+		 * sensor will retry sync on their own. Just mark stale for MQTT.
+		 */
+		unsigned int esl_addr_u = 0;
+
+		if (sscanf(data + 17, "%x", &esl_addr_u) == 1) {
+			uint16_t addr = (uint16_t)esl_addr_u;
+
+			for (int di = 0; di < tag_count; di++) {
+				if (tag_db[di].esl_addr == addr) {
+					tag_db[di].connected = false;
+					LOG_WRN("ESL desynced: 0x%04X (waiting for auto-resync)",
+						addr);
+					break;
+				}
+			}
+		}
+		return 0;
+	}
+
 	if (strncmp(data, "Connected:", 10) == 0) {
 		LOG_INF("ESL BLE connect: %s", data);
 		return 0;
@@ -1355,6 +1643,28 @@ int uart_sensor_process_data_line(const char *data)
 			     si--) {
 				sname[si] = '\0';
 			}
+
+			/* The gateway reconstructs resp_addr from
+			 *   (group_id << 8) | last_nus_target_low[group_id]
+			 * which can resolve to 0x0000 (e.g. for group 0 before
+			 * the per-group target table has been populated, or
+			 * when the response arrives via the broadcast slot).
+			 * In that case attribute the reply to the most recent
+			 * unicast `nus get_name 0x<addr>` we issued. */
+			if (esl_addr == 0x0000 && pending_get_name_addr != 0x0000) {
+				LOG_INF("SENSOR_NAME: attributing 0x0000 reply to pending 0x%04X",
+					pending_get_name_addr);
+				esl_addr = pending_get_name_addr;
+			}
+			/* Clear pending regardless \u2014 a fresh request will set it again. */
+			pending_get_name_addr = 0x0000;
+
+			if (esl_addr == 0x0000) {
+				LOG_WRN("Ignoring SENSOR_NAME for broadcast addr 0x0000 (no pending request): '%s'",
+					sname);
+				return 0;
+			}
+
 			int db_idx = esl_tag_db_find_or_add(esl_addr);
 
 			if (db_idx >= 0) {
@@ -1405,6 +1715,22 @@ int uart_sensor_process_data_line(const char *data)
 		const char *evt = data + 13;
 
 		LOG_INF("Sensor mgmt event: %s", evt);
+
+		/* Capture provisioning state so the boot sequence can decide
+		 * whether scanning is even allowed (see NRF91_USAGE_GUIDE.md \u00a72). */
+		if (strncmp(evt, "STATUS,", 7) == 0) {
+			const char *pp = strstr(evt, "PROVISIONED=");
+
+			if (pp) {
+				gateway_provisioned = (pp[12] == '1') ? 1 : 0;
+				LOG_INF("Gateway provisioned=%d", gateway_provisioned);
+			}
+		} else if (strncmp(evt, "PROVISIONED", 11) == 0) {
+			gateway_provisioned = 1;
+			LOG_INF("Gateway just transitioned to PROVISIONED");
+		} else if (strncmp(evt, "CLEARED", 7) == 0) {
+			gateway_provisioned = 0;
+		}
 
 		/* Publish to MQTT via zbus using response_text */
 		struct uart_sensor_msg mgmt_msg = {
@@ -1533,6 +1859,31 @@ int uart_sensor_process_data_line(const char *data)
 		}
 	} /* end if data[0] != '#' */
 
+	/* ---- Quietly absorb known-but-uninteresting telemetry events from the
+	 * gateway that would otherwise flood the log as "unrecognized". These
+	 * are diagnostic URCs we don't currently act on; keep at DBG so they
+	 * are still available with verbose logging. ---- */
+	if (data[0] == '#' && (
+		strncmp(data, "#PAWR_POLL:",   11) == 0 ||
+		strncmp(data, "#PAWR_RSP:",    10) == 0 ||
+		strncmp(data, "#PAWR:",         6) == 0 ||
+		strncmp(data, "#PAWR_GAP:",    10) == 0 ||
+		strncmp(data, "#RADIO_STATE:", 13) == 0 ||
+		strncmp(data, "#SCAN_SUMMARY:",14) == 0 ||
+		strncmp(data, "#NUS_GET_NAME:",14) == 0 ||
+		strncmp(data, "#NUS_SET_TIME:",14) == 0 ||
+		strncmp(data, "#NUS_STATUS:",  12) == 0 ||
+		strncmp(data, "#NUS_SENSORS:", 13) == 0)) {
+		LOG_DBG("UART event (silent): %s", data);
+		return 0;
+	}
+
+	/* Surface gateway shell errors so EBUSY/etc. are visible to the operator. */
+	if (strncmp(data, ">ERR:", 5) == 0 || strncmp(data, "ERR:", 4) == 0) {
+		LOG_WRN("Gateway shell error: %s", data);
+		return 0;
+	}
+
 	/* ---- Anything else: log locally; publish to MQTT only when debug echo is on ---- */
 	LOG_INF("UART unrecognized (not published): %s", data);
 
@@ -1574,15 +1925,25 @@ static void esl_startup_work_fn(struct k_work *work)
 		break;
 
 	case 1:
-		LOG_INF("ESL startup step 1: starting PAwR");
+		LOG_INF("ESL startup step 1: starting PAwR + querying whitelist state");
 		uart_sensor_esl_command("pawr start_pawr");
+		/* Ask the gateway whether the whitelist is sealed.  The reply
+		 * "#SENSOR_MGMT:STATUS,...,PROVISIONED=<0|1>" sets
+		 * gateway_provisioned and gates the next step. */
+		uart_sensor_mgmt_status();
 		esl_startup_step = 2;
 		k_work_reschedule_for_queue(&spi_work_q, &esl_startup_work, K_SECONDS(2));
 		break;
 
 	case 2:
-		LOG_INF("ESL startup step 2: starting scan");
-		uart_sensor_esl_scan_start();
+		if (gateway_provisioned == 1) {
+			LOG_INF("ESL startup step 2: gateway PROVISIONED — skipping scan");
+		} else {
+			LOG_INF("ESL startup step 2: gateway not provisioned (%d) — starting scan",
+				gateway_provisioned);
+			last_scan_request_ms = k_uptime_get();
+			uart_sensor_esl_scan_start();
+		}
 		esl_startup_step = 3;
 		k_work_reschedule_for_queue(&spi_work_q, &esl_startup_work, K_SECONDS(5));
 		break;
@@ -1591,16 +1952,22 @@ static void esl_startup_work_fn(struct k_work *work)
 		LOG_INF("ESL startup complete — starting periodic poll (every %ds)",
 			esl_poll_interval_sec);
 		uart_sensor_esl_poll_start();
-		/* Start scan retry loop if not all expected tags found yet */
-		esl_discovery_check();
+		/* Only run discovery (which may schedule another scan) if the
+		 * gateway is NOT already provisioned. When sealed, the fleet is
+		 * already known and scanning would waste PA-train air-time. */
+		if (gateway_provisioned != 1) {
+			esl_discovery_check();
+		}
 		/* Try to push UTC time to AP now that it is fully booted */
 		try_send_time_to_ap();
-		/* Request name(s) for any already-provisioned tags */
+		/* Request name(s) for any already-provisioned tags.
+		 * uart_sensor_esl_get_name(0xFFFF) fans out one unicast
+		 * "nus get_name 0x<addr>" per known tag (paced \u22652 s).
+		 * Bare "nus get_name" defaults to broadcast 0x0001 and is
+		 * silently dropped for any other address \u2014 do NOT use it. */
 		if (tag_count > 0) {
-			uart_sensor_esl_command("nus get_name");
+			(void)uart_sensor_esl_get_name(0xFFFF);
 		}
-		/* Query sensor whitelist status from gateway */
-		uart_sensor_mgmt_status();
 		break;
 
 	default:
@@ -1654,15 +2021,25 @@ static void esl_poll_work_fn(struct k_work *work)
 	/* Record poll time before sending commands */
 	last_poll_send_time = k_uptime_get();
 
-	/* Poll NUS status for each tag that has an assigned ESL address */
+	/* Health-probe each known tag with a single NUS status request.
+	 *
+	 * NOTE: The gateway auto-emits "#SENSOR_REPORT:TEMP/BATT,0x<addr>,<v>"
+	 * on its own schedule once any tag is synced \u2014 we DO NOT request
+	 * "nus sensors" here because that would race the auto-poll and the
+	 * gateway returns -16 (EBUSY). One "nus status" per tag is enough
+	 * to refresh uptime/flags and confirm the tag is alive.
+	 *
+	 * Address must be the real ESL address (hex) \u2014 NOT the array index.
+	 * The gateway treats decimal/zero as broadcast and silently drops
+	 * the request.
+	 */
 	for (int i = 0; i < tag_count; i++) {
-		if (tag_db[i].esl_addr != 0xFFFF && tag_db[i].valid) {
-			uart_sensor_esl_nus_status(i + 1); /* ESL shell uses 1-based IDs */
-			k_sleep(K_SECONDS(1));
-			/* Also request sensor data (temperature etc.) if the tag supports it */
-			uart_sensor_esl_nus_sensors(i + 1);
-			k_sleep(K_SECONDS(1));
+		if (!tag_db[i].valid || tag_db[i].esl_addr == 0xFFFF) {
+			continue;
 		}
+		uart_sensor_esl_nus_status(tag_db[i].esl_addr);
+		/* Per gateway protocol: \u22652 s between successive NUS cmds */
+		k_sleep(K_SECONDS(2));
 	}
 
 reschedule:
@@ -1745,14 +2122,35 @@ static void scan_retry_work_fn(struct k_work *work)
 		return;
 	}
 
+	if (gateway_provisioned == 1) {
+		/* Whitelist sealed — never on-demand scan. Tags will auto-resync
+		 * on PAwR by themselves. */
+		LOG_DBG("Scan retry suppressed: gateway provisioned");
+		return;
+	}
+
 	if (scan_active) {
 		/* nRF5340 scan still running — wait for #SCAN:Stop */
 		LOG_INF("Scan retry: scan in progress — waiting for #SCAN:Stop");
 		return;
 	}
 
-	LOG_INF("Scan retry: %d/%d tags connected — starting scan (attempt)",
+	int64_t now = k_uptime_get();
+	int64_t since = now - last_scan_request_ms;
+
+	if (last_scan_request_ms != 0 && since < ESL_SCAN_MIN_INTERVAL_MS) {
+		int64_t wait_ms = ESL_SCAN_MIN_INTERVAL_MS - since;
+
+		LOG_INF("Scan retry: backing off %lld ms (>=5 min between scans)",
+			wait_ms);
+		k_work_reschedule_for_queue(&spi_work_q, &scan_retry_work,
+					    K_MSEC(wait_ms));
+		return;
+	}
+
+	LOG_INF("Scan retry: %d/%d tags connected — starting scan",
 		conn, expected_tag_count);
+	last_scan_request_ms = now;
 	uart_sensor_esl_scan_start();
 	/* #SCAN:Stop will call esl_discovery_check() to schedule the next retry if needed.
 	 * Schedule a fallback in case #SCAN:Stop is never received from nRF5340. */
@@ -2017,8 +2415,9 @@ int uart_sensor_sample_request(void)
 	/* Trigger an immediate NUS status poll for all known tags */
 	if (esl_ap_ready && tag_count > 0) {
 		for (int i = 0; i < tag_count; i++) {
-			if (tag_db[i].esl_addr != 0xFFFF && tag_db[i].valid) {
-				uart_sensor_esl_nus_status(i + 1);
+			if (tag_db[i].valid && tag_db[i].esl_addr != 0xFFFF) {
+				/* Use real ESL hex address \u2014 not the array index */
+				uart_sensor_esl_nus_status(tag_db[i].esl_addr);
 				k_sleep(K_SECONDS(2));
 			}
 		}

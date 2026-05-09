@@ -178,6 +178,39 @@ void test_random_presses(void)
 	}
 }
 
+/* A press shorter than a few ms (e.g. mechanical noise) should still be
+ * classified as a short press, not be lost.
+ */
+void test_button_very_short_press_still_reported(void)
+{
+	const struct zbus_channel *chan;
+	struct button_msg msg;
+	int err;
+
+	TEST_ASSERT_NOT_NULL(button_handler);
+
+	button_handler(DK_BTN1_MSK, DK_BTN1_MSK);  /* Press */
+	k_msleep(5);
+	button_handler(0, DK_BTN1_MSK);            /* Release */
+
+	err = zbus_sub_wait_msg(&button_subscriber, &chan, &msg, K_MSEC(1000));
+	TEST_ASSERT_EQUAL(0, err);
+	TEST_ASSERT_EQUAL(BUTTON_PRESS_SHORT, msg.type);
+}
+
+/* Releasing without first pressing must not generate any event. */
+void test_button_release_without_press_no_event(void)
+{
+	const struct zbus_channel *chan;
+	struct button_msg msg;
+	int err;
+
+	button_handler(0, DK_BTN1_MSK);  /* Spurious release */
+
+	err = zbus_sub_wait_msg(&button_subscriber, &chan, &msg, K_MSEC(300));
+	TEST_ASSERT_NOT_EQUAL(0, err);
+}
+
 /* This is required to be added to each test. That is because unity's
  * main may return nonzero, while zephyr's main currently must
  * return 0 in all cases (other values are reserved).

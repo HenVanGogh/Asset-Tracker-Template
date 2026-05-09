@@ -16,9 +16,11 @@ rsource "src/modules/led/Kconfig.led"
 rsource "src/modules/fota/Kconfig.fota"
 rsource "src/modules/ext_dfu/Kconfig.ext_dfu"
 rsource "src/modules/spi_dfu/Kconfig.spi_dfu"
+rsource "src/modules/spi_fwd/Kconfig.spi_fwd"
 rsource "src/modules/environmental/Kconfig.environmental"
 rsource "src/modules/button/Kconfig.button"
 rsource "src/modules/uart_sensor/Kconfig.uart_sensor"
+rsource "src/modules/selftest/Kconfig.selftest"
 
 endmenu
 

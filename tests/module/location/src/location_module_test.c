@@ -52,9 +52,10 @@ static int custom_location_init(location_event_handler_t handler)
 static void verify_location_status(enum location_msg_type expected_status)
 {
 	struct location_msg received_msg;
+	const struct zbus_channel *chan;
 	int err;
 
-	err = zbus_chan_read(&LOCATION_CHAN, &received_msg, K_MSEC(100));
+	err = zbus_sub_wait_msg(&test_subscriber, &chan, &received_msg, K_MSEC(500));
 
 	TEST_ASSERT_EQUAL(0, err);
 	TEST_ASSERT_EQUAL(expected_status, received_msg.type);
@@ -64,9 +65,10 @@ static void verify_location_status(enum location_msg_type expected_status)
 static void verify_cellular_cloud_request(const struct lte_lc_cells_info *expected_cells)
 {
 	struct location_msg received_msg;
+	const struct zbus_channel *chan;
 	int err;
 
-	err = zbus_chan_read(&LOCATION_CHAN, &received_msg, K_MSEC(100));
+	err = zbus_sub_wait_msg(&test_subscriber, &chan, &received_msg, K_MSEC(500));
 
 	TEST_ASSERT_EQUAL(0, err);
 	TEST_ASSERT_EQUAL(LOCATION_CLOUD_REQUEST, received_msg.type);
@@ -135,9 +137,10 @@ static void verify_cellular_cloud_request(const struct lte_lc_cells_info *expect
 static void verify_wifi_cloud_request(const struct wifi_scan_info *expected_wifi)
 {
 	struct location_msg received_msg;
+	const struct zbus_channel *chan;
 	int err;
 
-	err = zbus_chan_read(&LOCATION_CHAN, &received_msg, K_MSEC(100));
+	err = zbus_sub_wait_msg(&test_subscriber, &chan, &received_msg, K_MSEC(500));
 
 	TEST_ASSERT_EQUAL(0, err);
 	TEST_ASSERT_EQUAL(LOCATION_CLOUD_REQUEST, received_msg.type);
@@ -168,9 +171,10 @@ static void verify_combined_cloud_request(const struct lte_lc_cells_info *expect
 					   const struct wifi_scan_info *expected_wifi)
 {
 	struct location_msg received_msg;
+	const struct zbus_channel *chan;
 	int err;
 
-	err = zbus_chan_read(&LOCATION_CHAN, &received_msg, K_MSEC(100));
+	err = zbus_sub_wait_msg(&test_subscriber, &chan, &received_msg, K_MSEC(500));
 
 	TEST_ASSERT_EQUAL(0, err);
 	TEST_ASSERT_EQUAL(LOCATION_CLOUD_REQUEST, received_msg.type);
@@ -198,9 +202,10 @@ static void verify_combined_cloud_request(const struct lte_lc_cells_info *expect
 static void verify_agnss_request(const struct nrf_modem_gnss_agnss_data_frame *expected_agnss)
 {
 	struct location_msg received_msg;
+	const struct zbus_channel *chan;
 	int err;
 
-	err = zbus_chan_read(&LOCATION_CHAN, &received_msg, K_MSEC(100));
+	err = zbus_sub_wait_msg(&test_subscriber, &chan, &received_msg, K_MSEC(500));
 
 	TEST_ASSERT_EQUAL(0, err);
 	TEST_ASSERT_EQUAL(LOCATION_AGNSS_REQUEST, received_msg.type);
@@ -302,8 +307,9 @@ void setUp(void)
 		/* Purge all messages from the channel */
 	}
 
-	/* Wait for module initialization */
-	k_sleep(K_MSEC(100));
+	/* location.c STATE_RUNNING entry sleeps K_SECONDS(2) before calling
+	 * location_init. Give it enough time to complete. */
+	k_sleep(K_MSEC(3000));
 }
 
 /* Test location library initialization */
@@ -367,7 +373,8 @@ void test_location_event_handler_basic(void)
 	/* Give the module time to process */
 	k_sleep(K_MSEC(100));
 
-	/* Verify location done message was published */
+	/* GNSS method: location.c publishes LOCATION_GNSS_DATA first, then LOCATION_SEARCH_DONE */
+	verify_location_status(LOCATION_GNSS_DATA);
 	verify_location_status(LOCATION_SEARCH_DONE);
 }
 
@@ -849,8 +856,8 @@ void test_location_timeout_handling(void)
 	/* Give the module time to process */
 	k_sleep(K_MSEC(100));
 
-	/* Verify location done message was published (timeout is treated as completion) */
-	verify_location_status(LOCATION_SEARCH_DONE);
+	/* Verify location timeout message was published */
+	verify_location_status(LOCATION_SEARCH_TIMEOUT);
 }
 
 /* Test location search started event */

@@ -1,0 +1,49 @@
+#
+# Copyright (c) 2025
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+menuconfig APP_SELFTEST
+	bool "Startup self-test module"
+	default y
+	depends on NRF_MODEM_LIB
+	help
+	  Enable the startup self-test module that checks SIM card,
+	  modem, network registration, PSM, DNS, and signal quality
+	  at boot. Results are reported via MQTT and indicated by
+	  RGB LED blink patterns (limited to a configurable window
+	  after boot to conserve power).
+
+if APP_SELFTEST
+
+config APP_SELFTEST_SIM_WAIT_SECONDS
+	int "Maximum wait time for SIM/network (seconds)"
+	default 240
+	help
+	  Maximum time in seconds to wait for SIM card readiness and
+	  network registration before declaring failure.
+	  Set to at least 240 (4 minutes) for slow SIM cards or
+	  weak-coverage areas.
+
+config APP_SELFTEST_LED_DURATION_SECONDS
+	int "LED error signaling window (seconds)"
+	default 60
+	help
+	  Maximum time in seconds after self-test completes during
+	  which LED error patterns are displayed. After this window
+	  the LED is turned off to save power. Set to 0 to disable
+	  LED signaling entirely.
+
+config APP_SELFTEST_THREAD_STACK_SIZE
+	int "Self-test thread stack size"
+	default 4096
+	help
+	  Stack size for the self-test thread. Needs to be large
+	  enough for AT command buffers and DNS resolution.
+
+module = APP_SELFTEST
+module-str = Selftest
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # APP_SELFTEST

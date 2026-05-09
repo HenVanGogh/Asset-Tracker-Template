@@ -28,6 +28,11 @@ tests/on_target/artifacts/
 *.tar.gz
 *.zip
 
+# Allow release binaries
+!release/
+!release/*.zip
+!release/*.hex
+
 # Backup files
 *.bak
 

@@ -134,15 +134,6 @@ static void send_cloud_connected(void)
 	TEST_ASSERT_EQUAL(0, err);
 }
 
-static void send_location_search_done(void)
-{
-	enum location_msg_type msg = LOCATION_SEARCH_DONE;
-
-	int err = zbus_chan_pub(&LOCATION_CHAN, &msg, K_SECONDS(1));
-
-	TEST_ASSERT_EQUAL(0, err);
-}
-
 static void send_fota_msg(enum fota_msg_type msg)
 {
 	int err;
@@ -201,21 +192,13 @@ static void send_network_disconnected(void)
 
 void test_init_to_triggering_state(void)
 {
-	/* Transition the module into STATE_TRIGGERING */
+	/* Cloud connect -> STATE_TRIGGERING -> STATE_SAMPLE_DATA -> sensor_and_poll_triggers_send */
 	send_cloud_connected();
 
-	/* There's an initial transition to STATE_SAMPLE_DATA, where the entry function
-	 * sends a location search trigger.
-	 */
-	expect_location_event(LOCATION_SEARCH_TRIGGER);
-
-	/* Complete location search */
-	send_location_search_done();
-	expect_location_event(LOCATION_SEARCH_DONE);
-
-	/* FOTA and other sensors are now polled */
-	expect_fota_event(FOTA_POLL_REQUEST);
+	/* sensor_and_poll_triggers_send publishes network quality request */
 	expect_network_event(NETWORK_QUALITY_SAMPLE_REQUEST);
+
+	/* power_sample_request stub publishes power request */
 	expect_power_event(POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST);
 
 	/* Cleanup */
@@ -225,25 +208,19 @@ void test_init_to_triggering_state(void)
 
 void test_button_press_on_connected(void)
 {
-	/* Transition to STATE_SAMPLE_DATA */
+	/* Transition to STATE_WAIT_FOR_TRIGGER */
 	send_cloud_connected();
-	expect_location_event(LOCATION_SEARCH_TRIGGER);
-
-	/* Transistion to STATE_WAIT_FOR_TRIGGER */
-	send_location_search_done();
-	expect_location_event(LOCATION_SEARCH_DONE);
-	expect_fota_event(FOTA_POLL_REQUEST);
 	expect_network_event(NETWORK_QUALITY_SAMPLE_REQUEST);
 	expect_power_event(POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST);
-
-	/* Transition back to STATE_SAMPLE_DATA */
-	button_handler(DK_BTN1_MSK, DK_BTN1_MSK);
-	expect_location_event(LOCATION_SEARCH_TRIGGER);
-
-	/* Cleanup */
-	send_cloud_disconnected();
 	purge_all_events();
 
+	/* Button press in STATE_WAIT_FOR_TRIGGER: handled by custom_mqtt, not main.
+	 * No state transition expected. */
+	button_handler(DK_BTN1_MSK, DK_BTN1_MSK);
+	k_sleep(K_MSEC(200));
+
+	/* Cleanup — disconnect cancels the pending timer */
+	send_cloud_disconnected();
 	expect_no_events(7200);
 }
 
@@ -262,35 +239,28 @@ void test_button_press_on_disconnected(void)
 
 void test_trigger_interval_change_in_connected(void)
 {
-	/* Transition to STATE_SAMPLE_DATA */
+	/* Transition to STATE_WAIT_FOR_TRIGGER */
 	send_cloud_connected();
-	expect_location_event(LOCATION_SEARCH_TRIGGER);
+	expect_network_event(NETWORK_QUALITY_SAMPLE_REQUEST);
+	expect_power_event(POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST);
+	purge_all_events();
 
 	/* As response to the shadow poll, the interval is set to 12 hours. */
 	twelve_hour_interval_set();
+	k_sleep(K_MSEC(100));
 
-	/* Transition to STATE_TRIGGER_WAIT where shadow is polled. */
-	send_location_search_done();
-	expect_location_event(LOCATION_SEARCH_DONE);
-	expect_fota_event(FOTA_POLL_REQUEST);
-	expect_network_event(NETWORK_QUALITY_SAMPLE_REQUEST);
-	expect_power_event(POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST);
-
-	/* Wait for the interval to alomost expire and ensure no events are triggered in
-	 * that time. Repeat this 10 times.
-	 */
+	/* Verify the module triggers at 12-hour intervals, 10 times */
 	for (int i = 0; i < 10; i++) {
 		int elapsed_time;
 
-		elapsed_time = wait_for_location_event(LOCATION_SEARCH_TRIGGER,
-						       HOUR_IN_SECONDS * 12);
-		TEST_ASSERT_INT_WITHIN(1, HOUR_IN_SECONDS * 12, elapsed_time);
+		elapsed_time = wait_for_network_event(NETWORK_QUALITY_SAMPLE_REQUEST,
+						      HOUR_IN_SECONDS * 12 + 1);
+		/* Allow ±5 s: purge_all_events() advances simulated clock ~2 s
+		 * before start_time is measured in the next iteration. */
+		TEST_ASSERT_INT_WITHIN(5, HOUR_IN_SECONDS * 12, elapsed_time);
 
-		send_location_search_done();
-		expect_location_event(LOCATION_SEARCH_DONE);
-		expect_fota_event(FOTA_POLL_REQUEST);
-		expect_network_event(NETWORK_QUALITY_SAMPLE_REQUEST);
 		expect_power_event(POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST);
+		purge_all_events();
 	}
 
 	/* Cleanup */
@@ -300,40 +270,39 @@ void test_trigger_interval_change_in_connected(void)
 
 void test_trigger_disconnect_and_connect_when_triggering(void)
 {
-	bool first_trigger_after_connect = true;
-
-	/* Transition to STATE_SAMPLE_DATA */
+	/* Connect and consume the immediate first-trigger network events */
 	send_cloud_connected();
+	expect_network_event(NETWORK_QUALITY_SAMPLE_REQUEST);
+	expect_power_event(POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST);
+	purge_all_events();
 
-	/* As response to the shadow poll, the interval is set to 12 hours. */
+	/* Set the interval to 12 hours */
 	twelve_hour_interval_set();
+	k_sleep(K_MSEC(100));
 
-	/* Wait for the interval to alomost expire and ensure no events are triggered in
-	 * that time. Repeat this 10 times. Every second iteration, disconnect and connect.
-	 */
 	for (int i = 0; i < 10; i++) {
 		int elapsed_time;
-		uint32_t timeout = first_trigger_after_connect ? 1 : HOUR_IN_SECONDS * 12;
 
-		elapsed_time = wait_for_location_event(LOCATION_SEARCH_TRIGGER,
-						       HOUR_IN_SECONDS * 12);
-		TEST_ASSERT_INT_WITHIN(1, timeout, elapsed_time);
-
-		send_location_search_done();
-		expect_location_event(LOCATION_SEARCH_DONE);
-		expect_fota_event(FOTA_POLL_REQUEST);
-		expect_network_event(NETWORK_QUALITY_SAMPLE_REQUEST);
+		elapsed_time = wait_for_network_event(NETWORK_QUALITY_SAMPLE_REQUEST,
+						      HOUR_IN_SECONDS * 12 + 1);
+		/* Allow ±5 s tolerance (simulated clock drift from purge overhead). */
+		TEST_ASSERT_INT_WITHIN(5, HOUR_IN_SECONDS * 12, elapsed_time);
 		expect_power_event(POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST);
+		purge_all_events();
 
-		first_trigger_after_connect = false;
-
-		/* Disconnect and connect every second iteration */
+		/* Disconnect and reconnect every second iteration */
 		if (i % 2 == 0) {
 			send_cloud_disconnected();
 			expect_no_events(7200);
 			send_cloud_connected();
 
-			first_trigger_after_connect = true;
+			/* After reconnect, first trigger is immediate */
+			expect_network_event(NETWORK_QUALITY_SAMPLE_REQUEST);
+			expect_power_event(POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST);
+			purge_all_events();
+
+			twelve_hour_interval_set();
+			k_sleep(K_MSEC(100));
 		}
 	}
 

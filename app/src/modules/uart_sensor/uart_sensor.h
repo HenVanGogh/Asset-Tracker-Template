@@ -245,6 +245,9 @@ int uart_sensor_esl_get_tag_count(void);
 /** @brief Get info for a specific tag by ESL address. */
 int uart_sensor_esl_get_tag_info(uint16_t esl_addr, struct esl_tag_info *info);
 
+/** @brief Get info for a specific tag by zero-based array index (0..count-1). */
+int uart_sensor_esl_get_tag_info_at(int index, struct esl_tag_info *info);
+
 /** @brief Set the expected number of ESL tags to discover.
  *  Scanning will repeat until this many tags are found.
  *  Default comes from CONFIG_APP_UART_SENSOR_ESL_EXPECTED_TAGS.
@@ -337,6 +340,30 @@ int uart_sensor_spi_xfer_locked(const uint8_t *tx, uint8_t *rx);
  * @return true if DATA_READY is HIGH, false otherwise.
  */
 bool uart_sensor_spi_drdy_active(void);
+
+/**
+ * @brief Send a FRAME_SMP_FWD (0x07) response back to the nRF5340.
+ *
+ * Called by the spi_fwd module after MCUmgr processes an SMP request
+ * received from the PC via the nRF5340 USB bridge.  Locks the SPI bus,
+ * builds the response frame, transceives, and processes any simultaneous
+ * RX frame from the nRF5340.
+ *
+ * @param payload  Raw SMP response payload (8-byte header + CBOR body).
+ * @param len      Payload length in bytes (max 512).
+ * @return 0 on success, negative errno on error.
+ */
+int uart_sensor_spi_send_smp_fwd(const uint8_t *payload, uint16_t len);
+
+/**
+ * @brief Submit a work item to the SPI workqueue.
+ *
+ * Allows external modules (e.g. spi_fwd) to run work on the dedicated
+ * SPI workqueue instead of the system workqueue.
+ *
+ * @param work  Pointer to the k_work item to submit.
+ */
+void uart_sensor_spi_submit_work(struct k_work *work);
 
 #ifdef __cplusplus
 }

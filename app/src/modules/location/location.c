@@ -131,38 +131,47 @@ static void location_wdt_callback(int channel_id, void *user_data)
 
 static void status_send(enum location_msg_type status)
 {
-	/* Log status instead of using ZBUS to avoid buffer exhaustion */
-	const char *status_str;
-	switch (status) {
-		case LOCATION_SEARCH_TRIGGER:
-			status_str = "LOCATION_SEARCH_TRIGGER";
-			break;
-		case LOCATION_SEARCH_DONE:
-			status_str = "LOCATION_SEARCH_DONE";
-			break;
-		case LOCATION_SEARCH_TIMEOUT:
-			status_str = "LOCATION_SEARCH_TIMEOUT";
-			break;
-		default:
-			status_str = "UNKNOWN";
-			break;
+	int err;
+	struct location_msg msg = {
+		.type = status,
+	};
+
+	err = zbus_chan_pub(&LOCATION_CHAN, &msg, K_MSEC(500));
+	if (err) {
+		LOG_ERR("zbus_chan_pub status, error: %d", err);
+		SEND_FATAL_ERROR();
 	}
-	LOG_DBG("Location status: %s", status_str);
 }
 
 static void cloud_request_send(const struct location_data_cloud *cloud_request)
 {
-	/* Log cloud request instead of using ZBUS to avoid buffer exhaustion */
-	LOG_DBG("Cloud location request received");
-	/* TODO: Implement cloud location service integration if needed */
+	int err;
+	struct location_msg msg = {
+		.type = LOCATION_CLOUD_REQUEST,
+		.cloud_request = *cloud_request,
+	};
+
+	err = zbus_chan_pub(&LOCATION_CHAN, &msg, K_MSEC(500));
+	if (err) {
+		LOG_ERR("zbus_chan_pub cloud_request, error: %d", err);
+		SEND_FATAL_ERROR();
+	}
 }
 
 #if defined(CONFIG_NRF_CLOUD_AGNSS)
 static void agnss_request_send(const struct nrf_modem_gnss_agnss_data_frame *agnss_request)
 {
-	/* Log AGNSS request instead of using ZBUS to avoid buffer exhaustion */
-	LOG_DBG("AGNSS request received");
-	/* TODO: Implement AGNSS service integration if needed */
+	int err;
+	struct location_msg msg = {
+		.type = LOCATION_AGNSS_REQUEST,
+		.agnss_request = *agnss_request,
+	};
+
+	err = zbus_chan_pub(&LOCATION_CHAN, &msg, K_MSEC(500));
+	if (err) {
+		LOG_ERR("zbus_chan_pub agnss_request, error: %d", err);
+		SEND_FATAL_ERROR();
+	}
 }
 #endif
 
@@ -175,16 +184,17 @@ static void gnss_location_send(const struct location_data *location_data)
 	};
 
 #if defined(CONFIG_APP_CUSTOM_MQTT)
-	/* Send directly to custom MQTT module to avoid ZBUS buffer exhaustion */
 	err = custom_mqtt_send_location_data(&location_msg);
 	if (err) {
 		LOG_WRN("Failed to send location data to MQTT module: %d", err);
-	} else {
-		LOG_DBG("Location data sent directly to MQTT module");
 	}
-#else
-	LOG_WRN("No MQTT module available, location data not sent");
 #endif
+
+	err = zbus_chan_pub(&LOCATION_CHAN, &location_msg, K_MSEC(500));
+	if (err) {
+		LOG_ERR("zbus_chan_pub gnss_data, error: %d", err);
+		SEND_FATAL_ERROR();
+	}
 }
 
 void trigger_location_update(void)

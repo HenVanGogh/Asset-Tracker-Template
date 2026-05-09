@@ -26,16 +26,14 @@ zephyr_include_directories(${ZEPHYR_BASE}/include/zephyr/)
 zephyr_include_directories(${ZEPHYR_BASE}/subsys/testsuite/include)
 
 zephyr_include_directories(${NRF_DIR}/include/net)
-zephyr_include_directories(${NRF_DIR}/subsys/net/lib/nrf_cloud/include)
-zephyr_include_directories(${NRF_DIR}/../modules/lib/cjson)
-zephyr_include_directories(${NRF_DIR}/../modules/lib/cjson)
 
 target_link_options(app PRIVATE --whole-archive)
 
 # Options that cannot be passed through Kconfig fragments
 target_compile_definitions(app PRIVATE
-	-DCONFIG_APP_CLOUD_PAYLOAD_BUFFER_MAX_SIZE=100
 	-DCONFIG_APP_FOTA_LOG_LEVEL=0
+	-DCONFIG_APP_FOTA_URL_MAX_LEN=256
+	-DCONFIG_APP_FOTA_SEC_TAG=-1
 	-DCONFIG_APP_FOTA_THREAD_STACK_SIZE=2500
 	-DCONFIG_APP_FOTA_MESSAGE_QUEUE_SIZE=5
 	-DCONFIG_APP_FOTA_MSG_PROCESSING_TIMEOUT_SECONDS=180
@@ -44,9 +42,4 @@ target_compile_definitions(app PRIVATE
 	-DCONFIG_DOWNLOADER_MAX_FILENAME_SIZE=256
 	-DCONFIG_DOWNLOADER_TRANSPORT_PARAMS_SIZE=64
 	-DCONFIG_DOWNLOADER_STACK_SIZE=4096
-	-DCONFIG_NRF_CLOUD_COAP=y
-	-DCONFIG_COAP_CLIENT_MESSAGE_HEADER_SIZE=64
-	-DCONFIG_COAP_CLIENT_MESSAGE_SIZE=1024
-	-DCONFIG_COAP_CLIENT_MAX_REQUESTS=5
-	-DCONFIG_COAP_CLIENT_BLOCK_SIZE=64
 )

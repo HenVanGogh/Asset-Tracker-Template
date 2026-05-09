@@ -16,6 +16,7 @@
 #include <zephyr/sys/reboot.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/random/random.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <cJSON.h>
 #include <date_time.h>
 #include <arpa/inet.h>
@@ -59,6 +60,10 @@
 
 #if defined(CONFIG_APP_BUTTON)
 #include "button.h"
+#endif
+
+#if defined(CONFIG_APP_SELFTEST)
+#include "selftest.h"
 #endif
 
 /* Register log module */
@@ -156,9 +161,35 @@ static void mqtt_inactivity_work_fn(struct k_work *work);
 /* Reconnect delay (module-level so it resets properly between error episodes) */
 static uint32_t mqtt_reconnect_delay_sec = MQTT_RECONNECT_BASE_DELAY_SEC;
 
+/* Count of consecutive failed connection attempts — drives exponential backoff.
+ * Reset to 0 on successful connection. Distinct from publish_failures which
+ * tracks data send errors while connected. */
+static uint32_t mqtt_failed_connect_count;
+
 /* Inactivity watchdog — reboots if no MQTT activity for MQTT_INACTIVITY_WATCHDOG_SEC */
 static struct k_work_delayable mqtt_inactivity_work;
 static int64_t last_mqtt_activity_ms;    /* k_uptime_get() of last MQTT I/O */
+
+union custom_mqtt_zbus_msg {
+	struct network_msg network;
+#if defined(CONFIG_APP_ENVIRONMENTAL)
+	struct environmental_msg environmental;
+#endif
+#if defined(CONFIG_APP_POWER)
+	struct power_msg power;
+#endif
+#if defined(CONFIG_APP_UART_SENSOR)
+	struct uart_sensor_msg uart_sensor;
+#endif
+#if defined(CONFIG_APP_BUTTON)
+	struct button_msg button;
+#endif
+#if defined(CONFIG_APP_SELFTEST)
+	struct selftest_msg selftest;
+#endif
+};
+
+static union custom_mqtt_zbus_msg custom_mqtt_zbus_msg_buf;
 static bool mqtt_inactive_reboot_flag;   /* set before reboot, cleared after reporting */
 
 /* Device name generation — set on first boot, persisted in settings */
@@ -312,6 +343,9 @@ ZBUS_CHAN_ADD_OBS(UART_SENSOR_CHAN, custom_mqtt_subscriber, 0);
 #if defined(CONFIG_APP_BUTTON)
 ZBUS_CHAN_ADD_OBS(BUTTON_CHAN, custom_mqtt_subscriber, 0);
 #endif
+#if defined(CONFIG_APP_SELFTEST)
+ZBUS_CHAN_ADD_OBS(SELFTEST_CHAN, custom_mqtt_subscriber, 0);
+#endif
 
 /* Define zbus channel */
 ZBUS_CHAN_DEFINE(CUSTOM_MQTT_CHAN,
@@ -334,6 +368,16 @@ static int mqtt_publish_data(const char *data, size_t len);
 /* Data validation helpers */
 static bool validate_sensor_data(double value, double min, double max);
 static int safe_publish_json(cJSON *json, const char *data_type);
+
+/* Self-test report — stored until MQTT is connected, then published once */
+#if defined(CONFIG_APP_SELFTEST)
+static struct selftest_msg selftest_result;
+static bool selftest_result_ready;
+static bool selftest_result_published;
+
+static void publish_selftest_report(void);
+static void process_selftest_msg(const struct selftest_msg *msg);
+#endif
 
 /* Location trigger functionality */
 #if defined(CONFIG_APP_LOCATION)
@@ -573,23 +617,43 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 							uart_sensor_esl_command("acl list");
 
 						} else if (strcmp(command->valuestring, "esl_nus_status") == 0) {
-							cJSON *id_json = cJSON_GetObjectItem(received_json, "id");
+							/* Accept both "esl_id" (preferred, consistent with esl_get_name)
+							 * and legacy "id" field. */
+							cJSON *id_json = cJSON_GetObjectItem(received_json, "esl_id");
+							if (!id_json) {
+								id_json = cJSON_GetObjectItem(received_json, "id");
+							}
 							if (id_json && cJSON_IsNumber(id_json)) {
 								uint16_t id = (uint16_t)id_json->valueint;
-								uart_sensor_esl_nus_status(id);
-								cJSON_AddStringToObject(response, "status", "nus_status_requested");
+								int cmd_ret = uart_sensor_esl_nus_status(id);
+
+								cJSON_AddStringToObject(response, "status",
+									cmd_ret == 0 ? "nus_status_requested" :
+									(cmd_ret == -EINVAL ? "invalid_id" : "error"));
 								cJSON_AddNumberToObject(response, "esl_id", id);
+								if (cmd_ret != 0) {
+									cJSON_AddNumberToObject(response, "error_code", cmd_ret);
+								}
 							} else {
 								cJSON_AddStringToObject(response, "status", "missing_id");
 							}
 
 						} else if (strcmp(command->valuestring, "esl_nus_sensors") == 0) {
-							cJSON *id_json = cJSON_GetObjectItem(received_json, "id");
+							cJSON *id_json = cJSON_GetObjectItem(received_json, "esl_id");
+							if (!id_json) {
+								id_json = cJSON_GetObjectItem(received_json, "id");
+							}
 							if (id_json && cJSON_IsNumber(id_json)) {
 								uint16_t id = (uint16_t)id_json->valueint;
-								uart_sensor_esl_nus_sensors(id);
-								cJSON_AddStringToObject(response, "status", "nus_sensors_requested");
+								int cmd_ret = uart_sensor_esl_nus_sensors(id);
+
+								cJSON_AddStringToObject(response, "status",
+									cmd_ret == 0 ? "nus_sensors_requested" :
+									(cmd_ret == -EINVAL ? "invalid_id" : "error"));
 								cJSON_AddNumberToObject(response, "esl_id", id);
+								if (cmd_ret != 0) {
+									cJSON_AddNumberToObject(response, "error_code", cmd_ret);
+								}
 							} else {
 								cJSON_AddStringToObject(response, "status", "missing_id");
 							}
@@ -661,25 +725,57 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 							uart_sensor_esl_command("acl list");
 
 						} else if (strcmp(command->valuestring, "esl_nus_reset") == 0) {
-							cJSON *id_json = cJSON_GetObjectItem(received_json, "id");
+							cJSON *id_json = cJSON_GetObjectItem(received_json, "esl_id");
+							if (!id_json) {
+								id_json = cJSON_GetObjectItem(received_json, "id");
+							}
 							if (id_json && cJSON_IsNumber(id_json)) {
 								char cmd[32];
-								snprintf(cmd, sizeof(cmd), "nus reset %d", id_json->valueint);
-								uart_sensor_esl_command(cmd);
-								cJSON_AddStringToObject(response, "status", "nus_reset_sent");
-								cJSON_AddNumberToObject(response, "esl_id", id_json->valueint);
+								uint16_t addr = (uint16_t)id_json->valueint;
+
+								if (addr == 0x0000 || addr == 0xFFFF) {
+									cJSON_AddStringToObject(response, "status", "invalid_id");
+									cJSON_AddNumberToObject(response, "esl_id", addr);
+								} else {
+									/* Gateway needs unicast hex address; decimal/0
+									 * resolves to broadcast and would reset every tag. */
+									snprintf(cmd, sizeof(cmd), "nus reset 0x%04x", addr);
+									int cmd_ret = uart_sensor_esl_command(cmd);
+
+									cJSON_AddStringToObject(response, "status",
+										cmd_ret == 0 ? "nus_reset_sent" : "error");
+									cJSON_AddNumberToObject(response, "esl_id", id_json->valueint);
+									if (cmd_ret != 0) {
+										cJSON_AddNumberToObject(response, "error_code", cmd_ret);
+									}
+								}
 							} else {
 								cJSON_AddStringToObject(response, "status", "missing_id");
 							}
 
 						} else if (strcmp(command->valuestring, "esl_nus_led") == 0) {
-							cJSON *id_json = cJSON_GetObjectItem(received_json, "id");
+							cJSON *id_json = cJSON_GetObjectItem(received_json, "esl_id");
+							if (!id_json) {
+								id_json = cJSON_GetObjectItem(received_json, "id");
+							}
 							if (id_json && cJSON_IsNumber(id_json)) {
 								char cmd[32];
-								snprintf(cmd, sizeof(cmd), "nus led %d", id_json->valueint);
-								uart_sensor_esl_command(cmd);
-								cJSON_AddStringToObject(response, "status", "nus_led_sent");
-								cJSON_AddNumberToObject(response, "esl_id", id_json->valueint);
+								uint16_t addr = (uint16_t)id_json->valueint;
+
+								if (addr == 0x0000 || addr == 0xFFFF) {
+									cJSON_AddStringToObject(response, "status", "invalid_id");
+									cJSON_AddNumberToObject(response, "esl_id", addr);
+								} else {
+									snprintf(cmd, sizeof(cmd), "nus led 0x%04x", addr);
+									int cmd_ret = uart_sensor_esl_command(cmd);
+
+									cJSON_AddStringToObject(response, "status",
+										cmd_ret == 0 ? "nus_led_sent" : "error");
+									cJSON_AddNumberToObject(response, "esl_id", id_json->valueint);
+									if (cmd_ret != 0) {
+										cJSON_AddNumberToObject(response, "error_code", cmd_ret);
+									}
+								}
 							} else {
 								cJSON_AddStringToObject(response, "status", "missing_id");
 							}
@@ -693,7 +789,10 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
 							if (tags_arr) {
 								for (int ti = 0; ti < tc; ti++) {
 									struct esl_tag_info tinfo;
-									if (uart_sensor_esl_get_tag_info((uint16_t)ti, &tinfo) == 0) {
+									/* Iterate by array index — NOT by ESL address.
+									 * `ti` is just the slot 0..count-1; the real
+									 * ESL address comes back inside `tinfo`. */
+									if (uart_sensor_esl_get_tag_info_at(ti, &tinfo) == 0) {
 										cJSON *t = cJSON_CreateObject();
 										if (t) {
 											char eid[16];
@@ -1949,6 +2048,7 @@ static void connected_entry(void *obj)
 
 	/* Successful connection — reset reconnect delay back to base */
 	mqtt_reconnect_delay_sec = MQTT_RECONNECT_BASE_DELAY_SEC;
+	mqtt_failed_connect_count = 0;
 	mqtt_ctx.publish_failures = 0;
 
 	/* Mark activity and start inactivity watchdog */
@@ -2012,6 +2112,11 @@ static void connected_entry(void *obj)
 
 	/* Start periodic data sending */
 	k_work_schedule(&mqtt_ctx.data_send_work, K_SECONDS(10));
+
+#if defined(CONFIG_APP_SELFTEST)
+	/* Publish pending self-test report now that MQTT is connected */
+	publish_selftest_report();
+#endif
 	
 #if defined(CONFIG_APP_LOCATION)
 	/* Temporarily disable automatic location updates to debug heap issues */
@@ -2087,8 +2192,15 @@ static void error_entry(void *obj)
 	k_work_cancel_delayable(&mqtt_ctx.location_trigger_work);
 #endif
 
-	/* Exponential backoff using module-level variable (resets on successful connect) */
-	if (mqtt_ctx.publish_failures > MQTT_MAX_PUBLISH_FAILURES) {
+	/* Exponential backoff based on consecutive failed connection attempts.
+	 * This applies from the very first failure to avoid rapid retry storms
+	 * (which drain battery and risk the carrier flagging the SIM for excessive
+	 * signaling). The delay doubles each attempt, capped at MQTT_RECONNECT_MAX_DELAY_SEC.
+	 *
+	 * Schedule: 5s, 10s, 20s, 40s, 80s, 160s, 300s (max).
+	 */
+	mqtt_failed_connect_count++;
+	if (mqtt_failed_connect_count > 1) {
 		mqtt_reconnect_delay_sec = MIN(mqtt_reconnect_delay_sec * 2,
 					       MQTT_RECONNECT_MAX_DELAY_SEC);
 	} else {
@@ -2518,10 +2630,14 @@ static void process_uart_sensor_data(const struct uart_sensor_msg *msg)
 		if (json) {
 			cJSON_AddStringToObject(json, "type", "esl_tag_connected");
 			cJSON_AddStringToObject(json, "mac", msg->probe_id);
-			char esl_id[16];
-			snprintf(esl_id, sizeof(esl_id), "ESL_0x%04X",
-				 msg->tag_info.esl_addr);
-			cJSON_AddStringToObject(json, "esl_id", esl_id);
+			if (msg->tag_info.esl_addr != 0x0000 &&
+			    msg->tag_info.esl_addr != 0xFFFF) {
+				char esl_id[16];
+
+				snprintf(esl_id, sizeof(esl_id), "ESL_0x%04X",
+					 msg->tag_info.esl_addr);
+				cJSON_AddStringToObject(json, "esl_id", esl_id);
+			}
 			safe_publish_json(json, "esl_tag_connected");
 			cJSON_Delete(json);
 		}
@@ -2649,13 +2765,30 @@ static void process_button_msg(const struct button_msg *msg)
 #if defined(CONFIG_APP_UART_SENSOR)
 		int n = uart_sensor_esl_get_tag_count();
 		if (n > 0) {
-			for (int i = 1; i <= n; i++) {
-				ret = uart_sensor_esl_nus_sensors(i);
-				if (ret != 0) {
-					LOG_WRN("Failed to poll ESL tag %d sensors: %d", i, ret);
+			int sent = 0;
+
+			for (int i = 0; i < n; i++) {
+				struct esl_tag_info tinfo;
+
+				if (uart_sensor_esl_get_tag_info_at(i, &tinfo) != 0) {
+					continue;
 				}
+				if (!tinfo.valid || tinfo.esl_addr == 0xFFFF) {
+					continue;
+				}
+				/* Use real ESL hex address; pass to uart_sensor which formats
+				 * the unicast "nus sensors 0x<addr>" command for the gateway. */
+				ret = uart_sensor_esl_nus_sensors(tinfo.esl_addr);
+				if (ret != 0) {
+					LOG_WRN("Failed to poll ESL 0x%04X sensors: %d",
+						tinfo.esl_addr, ret);
+				} else {
+					sent++;
+				}
+				/* Per gateway protocol: ≥2 s between successive NUS cmds */
+				k_sleep(K_SECONDS(2));
 			}
-			LOG_INF("ESL NUS sensors poll triggered for %d tag(s)", n);
+			LOG_INF("ESL NUS sensors poll triggered for %d tag(s)", sent);
 		} else {
 			LOG_INF("No ESL tags known — only power data will be published");
 		}
@@ -2664,6 +2797,122 @@ static void process_button_msg(const struct button_msg *msg)
 	/* Long press: reserved for future use */
 }
 #endif
+
+/* ---- Self-test MQTT report ---- */
+#if defined(CONFIG_APP_SELFTEST)
+
+static const char *selftest_flag_name(uint32_t flag)
+{
+	switch (flag) {
+	case SELFTEST_FLAG_SIM_NOT_DETECTED:   return "sim_not_detected";
+	case SELFTEST_FLAG_SIM_PIN_REQUIRED:   return "sim_pin_required";
+	case SELFTEST_FLAG_SIM_ICCID_FAIL:     return "iccid_read_fail";
+	case SELFTEST_FLAG_SIM_IMSI_FAIL:      return "imsi_read_fail";
+	case SELFTEST_FLAG_MODEM_FW_READ_FAIL: return "modem_fw_read_fail";
+	case SELFTEST_FLAG_NO_NETWORK_REG:     return "no_network_registration";
+	case SELFTEST_FLAG_NO_IP_ADDRESS:      return "no_ip_address";
+	case SELFTEST_FLAG_PSM_NOT_GRANTED:    return "psm_not_granted";
+	case SELFTEST_FLAG_EDRX_NOT_SUPPORTED: return "edrx_not_supported";
+	case SELFTEST_FLAG_DNS_FAIL:           return "dns_resolution_fail";
+	case SELFTEST_FLAG_CEREGF_FAIL:        return "cereg_format_fail";
+	case SELFTEST_FLAG_WEAK_SIGNAL:        return "weak_signal_rsrp";
+	case SELFTEST_FLAG_POOR_RSRQ:          return "poor_signal_quality_rsrq";
+	default:                               return "unknown";
+	}
+}
+
+static void publish_selftest_report(void)
+{
+	if (!selftest_result_ready || selftest_result_published) {
+		return;
+	}
+
+	cJSON *json = cJSON_CreateObject();
+	if (!json) {
+		LOG_ERR("Failed to create selftest JSON");
+		return;
+	}
+
+	cJSON_AddStringToObject(json, "type", "selftest_report");
+	cJSON_AddBoolToObject(json, "pass", selftest_result.flags == 0);
+	cJSON_AddNumberToObject(json, "flags", selftest_result.flags);
+	cJSON_AddNumberToObject(json, "test_duration_ms", selftest_result.test_duration_ms);
+
+	/* SIM / modem info */
+	cJSON *info = cJSON_AddObjectToObject(json, "modem_info");
+	if (info) {
+		if (strlen(selftest_result.iccid) > 0) {
+			cJSON_AddStringToObject(info, "iccid", selftest_result.iccid);
+		}
+		if (strlen(selftest_result.imsi) > 0) {
+			cJSON_AddStringToObject(info, "imsi", selftest_result.imsi);
+		}
+		if (strlen(selftest_result.modem_fw) > 0) {
+			cJSON_AddStringToObject(info, "modem_fw", selftest_result.modem_fw);
+		}
+		if (strlen(selftest_result.operator_name) > 0) {
+			cJSON_AddStringToObject(info, "operator", selftest_result.operator_name);
+		}
+	}
+
+	/* Signal quality */
+	cJSON *signal = cJSON_AddObjectToObject(json, "signal");
+	if (signal) {
+		cJSON_AddNumberToObject(signal, "rsrp_dbm", selftest_result.rsrp);
+		cJSON_AddNumberToObject(signal, "rsrq_x10_db", selftest_result.rsrq_x10_db);
+		cJSON_AddNumberToObject(signal, "snr_x10_db", selftest_result.snr);
+		cJSON_AddNumberToObject(signal, "cell_id", selftest_result.cell_id);
+		cJSON_AddNumberToObject(signal, "area_code", selftest_result.area_code);
+	}
+
+	/* PSM status */
+	cJSON *psm = cJSON_AddObjectToObject(json, "psm");
+	if (psm) {
+		cJSON_AddBoolToObject(psm, "granted", selftest_result.psm_granted);
+		cJSON_AddNumberToObject(psm, "tau_sec", selftest_result.psm_tau);
+		cJSON_AddNumberToObject(psm, "active_time_sec", selftest_result.psm_active_time);
+	}
+
+	/* Issue list (human-readable) */
+	if (selftest_result.flags != 0) {
+		cJSON *issues = cJSON_AddArrayToObject(json, "issues");
+		if (issues) {
+			for (int bit = 0; bit < 32; bit++) {
+				uint32_t flag = BIT(bit);
+				if (selftest_result.flags & flag) {
+					cJSON_AddItemToArray(issues,
+						cJSON_CreateString(selftest_flag_name(flag)));
+				}
+			}
+		}
+	}
+
+	int ret = safe_publish_json(json, "selftest_report");
+	cJSON_Delete(json);
+
+	if (ret == 0) {
+		selftest_result_published = true;
+		LOG_INF("Self-test report published to MQTT");
+	} else {
+		LOG_WRN("Failed to publish selftest report: %d (will retry)", ret);
+	}
+}
+
+static void process_selftest_msg(const struct selftest_msg *msg)
+{
+	if (msg->type == SELFTEST_COMPLETE) {
+		memcpy(&selftest_result, msg, sizeof(selftest_result));
+		selftest_result_ready = true;
+		selftest_result_published = false;
+		LOG_INF("Self-test result received (flags=0x%08X)", msg->flags);
+
+		/* If already connected, publish immediately */
+		if (mqtt_ctx.state == MQTT_STATE_CONNECTED) {
+			publish_selftest_report();
+		}
+	}
+}
+#endif /* CONFIG_APP_SELFTEST */
 
 static void process_network_msg(const struct network_msg *msg)
 {
@@ -2717,93 +2966,56 @@ static void custom_mqtt_thread(void)
 
 	while (1) {
 		/* Wait for messages on subscribed channels */
-		const void *msg_data;
 		/* Short timeout — smf_run_state at bottom drives mqtt_input/mqtt_live.
 		 * Must run frequently so incoming MQTT messages are read promptly. */
-		ret = zbus_sub_wait_msg(&custom_mqtt_subscriber, &chan, &msg_data, K_MSEC(100));
+		ret = zbus_sub_wait_msg(&custom_mqtt_subscriber, &chan,
+						&custom_mqtt_zbus_msg_buf, K_MSEC(100));
 		if (ret == 0) {
 			/* Process messages with proper synchronization and retry logic */
 			if (chan == &NETWORK_CHAN) {
-				struct network_msg msg;
-				ret = zbus_chan_read(&NETWORK_CHAN, &msg, K_MSEC(100));
-				if (ret == 0) {
-					k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
-					process_network_msg(&msg);
-					k_mutex_unlock(&mqtt_ctx.data_mutex);
-				} else {
-					LOG_WRN("Failed to read NETWORK_CHAN: %d", ret);
-				}
+				k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+				process_network_msg(&custom_mqtt_zbus_msg_buf.network);
+				k_mutex_unlock(&mqtt_ctx.data_mutex);
 			}
 #if defined(CONFIG_APP_ENVIRONMENTAL)
 			else if (chan == &ENVIRONMENTAL_CHAN) {
-				struct environmental_msg msg;
-				ret = zbus_chan_read(&ENVIRONMENTAL_CHAN, &msg, K_MSEC(100));
-				if (ret == 0) {
-					k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
-					process_environmental_data(&msg);
-					k_mutex_unlock(&mqtt_ctx.data_mutex);
-				} else {
-					/* Channel busy is common, only warn on other errors */
-					if (ret != -EBUSY) {
-						LOG_WRN("Failed to read ENVIRONMENTAL_CHAN: %d", ret);
-					} else {
-						LOG_DBG("ENVIRONMENTAL_CHAN busy, will retry");
-					}
-				}
+				k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+				process_environmental_data(&custom_mqtt_zbus_msg_buf.environmental);
+				k_mutex_unlock(&mqtt_ctx.data_mutex);
 			}
 #endif
 #if defined(CONFIG_APP_POWER)
 			else if (chan == &POWER_CHAN) {
-				struct power_msg msg;
-				ret = zbus_chan_read(&POWER_CHAN, &msg, K_MSEC(100));
-				if (ret == 0) {
-					k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
-					process_power_data(&msg);
-					k_mutex_unlock(&mqtt_ctx.data_mutex);
-					LOG_DBG("ZBUS power data processed: %.1f%%", msg.percentage);
-				} else {
-					if (ret != -EBUSY) {
-						LOG_WRN("Failed to read POWER_CHAN: %d", ret);
-					} else {
-						LOG_DBG("POWER_CHAN busy, will retry");
-					}
-				}
+				k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+				process_power_data(&custom_mqtt_zbus_msg_buf.power);
+				k_mutex_unlock(&mqtt_ctx.data_mutex);
+				LOG_DBG("ZBUS power data processed: %.1f%%",
+					(double)custom_mqtt_zbus_msg_buf.power.percentage);
 			}
 #endif
 #if defined(CONFIG_APP_UART_SENSOR)
 			else if (chan == &UART_SENSOR_CHAN) {
-				struct uart_sensor_msg msg;
-				ret = zbus_chan_read(&UART_SENSOR_CHAN, &msg, K_MSEC(100));
-				if (ret == 0) {
-					k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
-					process_uart_sensor_data(&msg);
-					k_mutex_unlock(&mqtt_ctx.data_mutex);
-					LOG_DBG("ZBUS UART sensor data processed: %s, T=%.1f°C", 
-						msg.probe_id, (double)msg.temperature);
-				} else {
-					if (ret != -EBUSY) {
-						LOG_WRN("Failed to read UART_SENSOR_CHAN: %d", ret);
-					} else {
-						LOG_DBG("UART_SENSOR_CHAN busy, will retry");
-					}
-				}
+				const struct uart_sensor_msg *msg = &custom_mqtt_zbus_msg_buf.uart_sensor;
+
+				k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+				process_uart_sensor_data(msg);
+				k_mutex_unlock(&mqtt_ctx.data_mutex);
+				LOG_DBG("ZBUS UART sensor data processed: %s, T=%.1f°C",
+					msg->probe_id, (double)msg->temperature);
 			}
 #endif
 #if defined(CONFIG_APP_BUTTON)
 			else if (chan == &BUTTON_CHAN) {
-				struct button_msg msg;
-				ret = zbus_chan_read(&BUTTON_CHAN, &msg, K_MSEC(100));
-				if (ret == 0) {
-					k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
-					process_button_msg(&msg);
-					k_mutex_unlock(&mqtt_ctx.data_mutex);
-				} else {
-					if (ret != -EBUSY) {
-						LOG_WRN("Failed to read BUTTON_CHAN: %d", ret);
-					} else {
-						LOG_DBG("BUTTON_CHAN busy, will retry");
-					}
-				}
+				k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+				process_button_msg(&custom_mqtt_zbus_msg_buf.button);
+				k_mutex_unlock(&mqtt_ctx.data_mutex);
+			}
+#endif
+#if defined(CONFIG_APP_SELFTEST)
+			else if (chan == &SELFTEST_CHAN) {
+				k_mutex_lock(&mqtt_ctx.data_mutex, K_FOREVER);
+				process_selftest_msg(&custom_mqtt_zbus_msg_buf.selftest);
+				k_mutex_unlock(&mqtt_ctx.data_mutex);
 			}
 #endif
 		}
@@ -2842,15 +3054,53 @@ static int custom_mqtt_init(void)
 #endif
 	mqtt_rt_cfg.power_mode = POWER_MODE_NORMAL;
 
-	/* Load persisted settings — overrides Kconfig defaults if previously saved */
-	settings_load();
+	/* Initialize the settings subsystem (FCB backend) before any load/save.
+	 * Without this, settings_load() and settings_save_one() silently fail,
+	 * which previously caused the generated device name to be regenerated
+	 * (and not persisted) on every boot.
+	 */
+	{
+		int sirc = settings_subsys_init();
 
-	/* On first boot, generate a unique device name: gateway_XXXX (random hex) */
+		if (sirc && sirc != -EALREADY) {
+			LOG_ERR("settings_subsys_init failed: %d", sirc);
+		}
+	}
+
+	/* Load persisted settings — overrides Kconfig defaults if previously saved */
+	{
+		int lrc = settings_load();
+
+		if (lrc) {
+			LOG_WRN("settings_load failed: %d", lrc);
+		}
+	}
+
+	/* On first boot (or after full erase), generate a deterministic device name
+	 * from the hardware FICR DEVICEID so reflashing never randomises the name.
+	 * Falls back to sys_rand32_get() if hwinfo is unavailable. */
 	if (!name_generated) {
-		uint32_t rand_val = sys_rand32_get();
+		uint8_t hw_id[8];
+		uint16_t name_seed;
+
+		int hw_id_len = hwinfo_get_device_id(hw_id, sizeof(hw_id));
+
+		if (hw_id_len >= 2) {
+			/* Use the last two bytes of FICR DEVICEID (most varying bits).
+			 * Clamp to hw_id_len - 2 so we never read past the buffer.
+			 */
+			int use = MIN(hw_id_len - 2, 6);
+
+			name_seed = ((uint16_t)hw_id[use] << 8) | hw_id[use + 1];
+			LOG_INF("Using FICR hardware ID for device name (seed=0x%04X)",
+				name_seed);
+		} else {
+			LOG_WRN("hwinfo unavailable, using random seed for device name");
+			name_seed = (uint16_t)(sys_rand32_get() & 0xFFFF);
+		}
 
 		snprintf(mqtt_rt_cfg.client_id, sizeof(mqtt_rt_cfg.client_id),
-			 "gateway_%04X", (uint16_t)(rand_val & 0xFFFF));
+			 "gateway_%04X", name_seed);
 		snprintf(mqtt_rt_cfg.pub_topic, sizeof(mqtt_rt_cfg.pub_topic),
 			 "gateway/%s/data", mqtt_rt_cfg.client_id);
 		snprintf(mqtt_rt_cfg.sub_topic, sizeof(mqtt_rt_cfg.sub_topic),

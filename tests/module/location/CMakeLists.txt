@@ -33,6 +33,13 @@ zephyr_compile_definitions(UNITY_INCLUDE_DOUBLE)
 
 target_link_options(app PRIVATE --whole-archive)
 
+# location.c has variables only used when CONFIG_APP_CUSTOM_MQTT is set;
+# suppress the resulting unused-variable warning for that translation unit.
+set_source_files_properties(
+  ${ASSET_TRACKER_TEMPLATE_DIR}/app/src/modules/location/location.c
+  PROPERTIES COMPILE_FLAGS "-Wno-unused-variable"
+)
+
 # Options that cannot be passed through Kconfig fragments
 target_compile_definitions(app PRIVATE
   -DCONFIG_APP_LOCATION_LOG_LEVEL=4

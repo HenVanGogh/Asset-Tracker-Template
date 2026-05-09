@@ -11,6 +11,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/storage/flash_map.h>
+#include <zephyr/settings/settings.h>
 #include <net/downloader.h>
 #include <pm_config.h>
 #include <string.h>
@@ -30,6 +31,15 @@ static const char *const target_name[EXT_DFU_TARGET_COUNT] = {
 	[EXT_DFU_TARGET_NRF5340]  = "nRF5340",
 	[EXT_DFU_TARGET_NRF52840] = "nRF52840",
 };
+
+/* Settings keys used to persist downloaded firmware size across reboots */
+static const char *const target_settings_key[EXT_DFU_TARGET_COUNT] = {
+	[EXT_DFU_TARGET_NRF5340]  = "ext_dfu/nrf5340_size",
+	[EXT_DFU_TARGET_NRF52840] = "ext_dfu/nrf52840_size",
+};
+
+/* Persisted firmware sizes — non-zero means firmware is ready after reboot */
+static size_t persisted_size[EXT_DFU_TARGET_COUNT];
 
 /* ─── Download context ──────────────────────────────────────────────────── */
 
@@ -149,6 +159,11 @@ static int dl_callback(const struct downloader_evt *event)
 			target_name[ctx.target], (unsigned int)ctx.bytes_written);
 		ctx.state = EXT_DFU_STATE_DONE;
 		ctx.file_size = ctx.bytes_written;
+		/* Persist size so spi_dfu can proceed after a reboot */
+		persisted_size[ctx.target] = ctx.bytes_written;
+		settings_save_one(target_settings_key[ctx.target],
+				  &ctx.bytes_written,
+				  sizeof(ctx.bytes_written));
 		slot_close();
 		ctx.busy = false;
 		break;
@@ -325,18 +340,36 @@ int ext_dfu_get_status(enum ext_dfu_target target, struct ext_dfu_status *status
 			status->slot_size = 0;
 		}
 	} else {
-		/* Idle — just report slot size */
-		status->state = EXT_DFU_STATE_IDLE;
-		status->progress_pct = -1;
-		status->bytes_written = 0;
-		status->file_size = 0;
-		status->error = 0;
-		const struct flash_area *fa;
-		if (flash_area_open(slot_pm_id[target], &fa) == 0) {
-			status->slot_size = fa->fa_size;
-			flash_area_close(fa);
+		/* Idle — check if a persisted (rebooted) firmware is available */
+		if (persisted_size[target] > 0) {
+			status->state = EXT_DFU_STATE_DONE;
+			status->bytes_written = persisted_size[target];
+			status->file_size = persisted_size[target];
+			status->progress_pct = 100;
+			status->error = 0;
+			const struct flash_area *fa;
+
+			if (flash_area_open(slot_pm_id[target], &fa) == 0) {
+				status->slot_size = fa->fa_size;
+				flash_area_close(fa);
+			} else {
+				status->slot_size = 0;
+			}
 		} else {
-			status->slot_size = 0;
+			/* Truly idle — no firmware downloaded */
+			status->state = EXT_DFU_STATE_IDLE;
+			status->progress_pct = -1;
+			status->bytes_written = 0;
+			status->file_size = 0;
+			status->error = 0;
+			const struct flash_area *fa;
+
+			if (flash_area_open(slot_pm_id[target], &fa) == 0) {
+				status->slot_size = fa->fa_size;
+				flash_area_close(fa);
+			} else {
+				status->slot_size = 0;
+			}
 		}
 	}
 
@@ -373,16 +406,53 @@ int ext_dfu_erase(enum ext_dfu_target target)
 		ctx.bytes_written = 0;
 		ctx.file_size = 0;
 		ctx.error = 0;
+		/* Clear persisted size so spi_dfu won't use stale firmware */
+		persisted_size[target] = 0;
+		size_t zero = 0;
+
+		settings_save_one(target_settings_key[target], &zero, sizeof(zero));
 	}
 
 	k_mutex_unlock(&ctx.lock);
 	return err;
 }
 
-/* Module init — just initialize the mutex */
+/* ─── Settings handler ──────────────────────────────────────────────────── */
+
+static int ext_dfu_settings_set(const char *key, size_t len,
+				 settings_read_cb read_cb, void *cb_arg)
+{
+	size_t val = 0;
+
+	if (read_cb(cb_arg, &val, sizeof(val)) != sizeof(val)) {
+		return -EINVAL;
+	}
+	if (strcmp(key, "nrf5340_size") == 0) {
+		persisted_size[EXT_DFU_TARGET_NRF5340] = val;
+		if (val > 0) {
+			LOG_INF("ext_dfu: restored nRF5340 firmware (%u bytes) from settings",
+				(unsigned int)val);
+		}
+	} else if (strcmp(key, "nrf52840_size") == 0) {
+		persisted_size[EXT_DFU_TARGET_NRF52840] = val;
+		if (val > 0) {
+			LOG_INF("ext_dfu: restored nRF52840 firmware (%u bytes) from settings",
+				(unsigned int)val);
+		}
+	}
+	return 0;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(ext_dfu_stg, "ext_dfu", NULL,
+				ext_dfu_settings_set, NULL, NULL);
+
+/* Module init — initialize mutex and restore persisted firmware state */
 static int ext_dfu_init(void)
 {
 	k_mutex_init(&ctx.lock);
+	/* Load persisted firmware sizes from settings so spi_dfu can proceed
+	 * without requiring a re-download after every reboot. */
+	settings_load_subtree("ext_dfu");
 	LOG_INF("ext_dfu: ready (nRF5340 slot %u B @ PM %u, nRF52840 slot %u B @ PM %u)",
 		PM_NRF5340_DFU_SIZE, PM_NRF5340_DFU_ID,
 		PM_NRF52840_DFU_SIZE, PM_NRF52840_DFU_ID);

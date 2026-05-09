@@ -35,6 +35,10 @@
 #include "led.h"
 #endif /* CONFIG_APP_LED */
 
+#if defined(CONFIG_APP_SELFTEST)
+#include "selftest.h"
+#endif /* CONFIG_APP_SELFTEST */
+
 #if defined(CONFIG_APP_ENVIRONMENTAL)
 #include "environmental.h"
 #endif /* CONFIG_APP_ENVIRONMENTAL */
@@ -455,6 +459,10 @@ static void idle_entry(void *o)
 	LOG_DBG("%s", __func__);
 
 #if defined(CONFIG_APP_LED)
+	/* Skip LED update if selftest is displaying diagnostic patterns */
+#if defined(CONFIG_APP_SELFTEST)
+	if (!selftest_led_is_active()) {
+#endif
 	int err;
 	/* Blink Yellow */
 	struct led_msg led_msg = {
@@ -473,6 +481,9 @@ static void idle_entry(void *o)
 		SEND_FATAL_ERROR();
 		return;
 	}
+#if defined(CONFIG_APP_SELFTEST)
+	}
+#endif
 #endif /* CONFIG_APP_LED */
 
 	(void)k_work_cancel_delayable(&trigger_work);
@@ -594,6 +605,10 @@ static void sample_data_entry(void *o)
 	LOG_DBG("%s", __func__);
 
 #if defined(CONFIG_APP_LED)
+	/* Skip LED update if selftest is displaying diagnostic patterns */
+#if defined(CONFIG_APP_SELFTEST)
+	if (!selftest_led_is_active()) {
+#endif
 	/* Green pattern during active sampling */
 	struct led_msg led_msg = {
 		.type = LED_RGB_SET,
@@ -611,6 +626,9 @@ static void sample_data_entry(void *o)
 		SEND_FATAL_ERROR();
 		return;
 	}
+#if defined(CONFIG_APP_SELFTEST)
+	}
+#endif
 #endif /* CONFIG_APP_LED */
 
 	/* Record the start time of sampling */
@@ -695,6 +713,10 @@ static void wait_for_trigger_entry(void *o)
 	}
 
 #if defined(CONFIG_APP_LED)
+	/* Skip LED update if selftest is displaying diagnostic patterns */
+#if defined(CONFIG_APP_SELFTEST)
+	if (!selftest_led_is_active()) {
+#endif
 	/* Blue pattern for wait state */
 	struct led_msg led_msg = {
 		.type = LED_RGB_SET,
@@ -712,6 +734,9 @@ static void wait_for_trigger_entry(void *o)
 		SEND_FATAL_ERROR();
 		return;
 	}
+#if defined(CONFIG_APP_SELFTEST)
+	}
+#endif
 #endif /* CONFIG_APP_LED */
 
 
@@ -804,6 +829,10 @@ static void fota_downloading_entry(void *o)
 #if defined(CONFIG_APP_LED)
 	int err;
 
+	/* Skip LED update if selftest is displaying diagnostic patterns */
+#if defined(CONFIG_APP_SELFTEST)
+	if (!selftest_led_is_active()) {
+#endif
 	/* Purple pattern during download - indefinite for ongoing process */
 	struct led_msg led_msg = {
 		.type = LED_RGB_SET,
@@ -821,6 +850,9 @@ static void fota_downloading_entry(void *o)
 		SEND_FATAL_ERROR();
 		return;
 	}
+#if defined(CONFIG_APP_SELFTEST)
+	}
+#endif
 #endif /* CONFIG_APP_LED */
 }
 
